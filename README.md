@@ -29,9 +29,12 @@ your domain(s) ─┤→  Fortmail worker  →  triage desk (only what matters)
   (worth keeping), `ignore` (bulk/OTP noise). A cron sweeps one scope every
   5 minutes and caches the desk, so reading it is instant.
 - **Speaks MCP.** `/mcp` is a Model Context Protocol server with its own
-  OAuth (dynamic client registration + PKCE). Connect it to Claude, or any
-  MCP client, and your agent gets six tools: `list_accounts`, `get_desk`,
-  `triage`, `read_box`, `read_message`, `send`.
+  OAuth (dynamic client registration + PKCE). MCP is vendor-neutral — connect
+  any agent that takes an MCP server (Claude, ChatGPT, Gemini, Cursor, your
+  own harness) and it gets six tools: `list_accounts`, `get_desk`, `triage`,
+  `read_box`, `read_message`, `send`. There is **no LLM inside Fortmail
+  itself** — no model dependency, no API key to any AI vendor; the
+  intelligence is whatever agent you point at it.
 - **Sends as anyone you own.** Gmail via the API, everything else via SMTP —
   transport picked automatically from the `from` address.
 - **Wakes your agent on mail** (optional). Give the agent its own address
@@ -62,6 +65,11 @@ npx wrangler deploy
 Then connect mailboxes — see [docs/SETUP.md](docs/SETUP.md) for the full
 walkthrough (Gmail OAuth app, IMAP boxes, the steward bridge) and
 [docs/AGENT.md](docs/AGENT.md) for pointing your agent at it.
+
+**Or skip the manual setup entirely:** fork this repo and point your coding
+agent — any vendor — at it. [`AGENTS.md`](AGENTS.md) is a runbook the agent
+can execute end-to-end; it will ask you only for the human-gated steps
+(Cloudflare login, mailbox passwords, OAuth approvals).
 
 The 60-second version, with `KEY` = your TRIGGER_KEY and `W` = your worker URL:
 

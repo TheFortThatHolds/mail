@@ -95,11 +95,20 @@ mail speaks a different dialect — it's your worker.
 
 ## 4. Connect your agent (MCP)
 
-Add `https://<your-worker>/mcp` wherever your agent takes MCP servers —
-e.g. claude.ai → Settings → Connectors → Add custom connector, or
-`claude mcp add --transport http fortmail https://<your-worker>/mcp` for
-Claude Code. The OAuth dance is automatic (dynamic client registration +
-PKCE); when a password is asked for, it's your `TRIGGER_KEY`.
+Add `https://<your-worker>/mcp` wherever your agent takes MCP servers.
+MCP is vendor-neutral, so any MCP-capable agent works. Examples:
+
+- **Claude** — claude.ai → Settings → Connectors → Add custom connector; or
+  `claude mcp add --transport http fortmail https://<your-worker>/mcp`
+- **ChatGPT / Codex** — add it as a connector (Settings → Connectors) or in
+  `~/.codex/config.toml` as an `mcp_servers` entry
+- **Cursor / Windsurf / other IDE agents** — add an MCP server entry with the
+  URL above (transport: streamable HTTP)
+- **Your own harness** — anything that speaks MCP over streamable HTTP with
+  OAuth discovery; see [AGENT.md](AGENT.md) § Connection details
+
+The OAuth dance is automatic (dynamic client registration + PKCE); when a
+password is asked for, it's your `TRIGGER_KEY`.
 
 The agent gets: `list_accounts`, `get_desk`, `triage`, `read_box`,
 `read_message`, `send`.
