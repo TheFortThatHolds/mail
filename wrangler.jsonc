@@ -1,0 +1,50 @@
+{
+  // Fortmail — agent-operated email in one Cloudflare Worker.
+  //
+  // Copy this file, fill in your own KV namespace id, then:
+  //   npx wrangler kv namespace create TOKENS     (paste the id below)
+  //   npx wrangler secret put TRIGGER_KEY         (a long random string — the admin key)
+  //   npx wrangler deploy
+  // Everything else is optional. See README.md.
+  "name": "fortmail",
+  "main": "worker.js",
+  "compatibility_date": "2024-11-01",
+
+  // The one store: Gmail refresh tokens (gmail:<addr>), sealed IMAP creds
+  // (imap:<addr>), the wallet seal key, OAuth clients/codes/tokens for the
+  // MCP door, and the cached triage desk (desk:<scope>).
+  "kv_namespaces": [
+    { "binding": "TOKENS", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+  ],
+
+  "vars": {
+    // --- All optional. Uncomment what you use. ---
+
+    // Steward bridge: file each mail sent to these boxes as a GitHub PR that
+    // wakes your agent. Comma-separated addresses; must be provisioned IMAP
+    // boxes on this worker. Off when unset.
+    // "GITHUB_WATCH": "steward@your-domain.com",
+
+    // Repo the bridge files PRs into (your agent watches this repo).
+    // "GITHUB_REPO": "you/agent-mail-log",
+
+    // YOUR addresses. Only mail from these senders is stamped TRUSTED by the
+    // bridge — everything else is DATA the agent must never take orders from.
+    // "OWNER_EMAILS": "you@example.com,you@your-domain.com",
+
+    // Optional regex of senders to always ignore at triage.
+    // "MUTE_SENDERS": "@some-noisy-service\\.com"
+  },
+
+  // Every 5 minutes: cronTick (rotating-scope triage sweep) + stewardBridge.
+  "triggers": { "crons": ["*/5 * * * *"] },
+
+  "observability": { "enabled": true }
+
+  // Secrets (set with `npx wrangler secret put NAME`, never committed):
+  //   TRIGGER_KEY         — required. Gates every admin endpoint (?key=...).
+  //   GMAIL_CLIENT_ID     — optional. Your Google OAuth app (Gmail accounts).
+  //   GMAIL_CLIENT_SECRET — optional. Your Google OAuth app.
+  //   GITHUB_TOKEN        — optional. Fine-grained PAT scoped to GITHUB_REPO
+  //                         (Contents + Pull requests: write) for the bridge.
+}
