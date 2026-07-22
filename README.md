@@ -37,6 +37,13 @@ your domain(s) ─┤→  Fortmail worker  →  triage desk (only what matters)
   intelligence is whatever agent you point at it.
 - **Sends as anyone you own.** Gmail via the API, everything else via SMTP —
   transport picked automatically from the `from` address.
+- **Runs your newsletters.** Subscriber lists live in *your* KV (not an
+  ESP's database), with double opt-in, one-click unsubscribe (RFC 8058),
+  bounce/complaint suppression, and campaigns that drain through the cron in
+  rate-safe chunks via a relay (Resend) that's just a dumb pipe. Per-subscriber
+  rent is the ESP business model; this is per-email dimes. Any number of
+  lists — a pen name, a brand, a product each get a row, not an account.
+  See [docs/NEWSLETTER.md](docs/NEWSLETTER.md).
 - **Wakes your agent on mail** (optional). Give the agent its own address
   (e.g. `steward@your-domain.com`). Every unseen message there becomes a
   GitHub pull request in a repo your agent watches — with the sender stamped
@@ -122,12 +129,21 @@ consequential, gate on your explicit approval, not on a From header.
 | `/connect?key=` → `/oauth/callback` | Gmail account OAuth flow |
 | `/import?key=` | Import an existing Gmail refresh token |
 | `/bridge-run?key=&dry=1` | Run/inspect the steward bridge now |
+| `/news/subscribe?list=` | Public signup (double opt-in) — see [docs/NEWSLETTER.md](docs/NEWSLETTER.md) |
+| `/news/list?key=` / `/news/lists?key=` | Create lists / list them with counts |
+| `/news/send?key=` | Queue a campaign (or `test` to one address) |
+| `/news/campaign?key=` / `/news/drain?key=` | Campaign progress / push the queue now |
+| `/news/relay?key=` | Seal the relay API key (or use broker-mode vars) |
+| `/news/hook` | Relay webhook → suppression on bounce/complaint |
 
 ## Design notes
 
-- **One file on purpose.** ~330 lines, zero dependencies, reviewable in one
+- **One file on purpose.** ~550 lines, zero dependencies, reviewable in one
   sitting. Email holds your whole life; you should be able to read every line
   of the thing that touches it.
+- **You own the audience.** The newsletter engine keeps subscribers as rows in
+  your KV; the sending relay never holds the list. Leaving a relay is a config
+  change, not a migration.
 - **90-day window** on both Gmail and IMAP (`SINCE` search) so ancient mail
   can never flood the desk.
 - **Rotating cron scopes.** Each 5-minute tick sweeps ONE scope (gmail, or one

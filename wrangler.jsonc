@@ -33,10 +33,34 @@
     // "OWNER_EMAILS": "you@example.com,you@your-domain.com",
 
     // Optional regex of senders to always ignore at triage.
-    // "MUTE_SENDERS": "@some-noisy-service\\.com"
+    // "MUTE_SENDERS": "@some-noisy-service\\.com",
+
+    // --- Newsletter engine (all optional — see docs/NEWSLETTER.md) ---
+
+    // This worker's public hostname (no scheme). Only needed so campaigns
+    // queued over MCP can build their unsubscribe links; REST-queued
+    // campaigns learn it from the request.
+    // "PUBLIC_HOST": "fortmail.your-subdomain.workers.dev",
+
+    // How many emails each 5-minute cron tick sends (default 30 — safe on the
+    // free plan's ~50-subrequest budget; raise on a paid plan).
+    // "NEWS_BATCH": "30",
+
+    // Relay broker mode: send through a credential broker's /agent/use door
+    // (e.g. a Fort Card wallet) so the relay API key NEVER exists on this
+    // worker. When unset, the fallback is a key sealed into KV via
+    // POST /news/relay (X-Relay-Key header).
+    // "RELAY_BROKER_URL": "https://card.your-domain.com",
+    // "RELAY_BROKER_REPO": "you/your-config-repo",
+    // "RELAY_CARD": "card_xxxxxxxx",
+
+    // Gates the bounce/complaint webhook (?s=...) so strangers can't forge
+    // suppressions. Any random string — NOT your TRIGGER_KEY.
+    // "NEWS_HOOK_SECRET": "another-long-random-string"
   },
 
-  // Every 5 minutes: cronTick (rotating-scope triage sweep) + stewardBridge.
+  // Every 5 minutes: cronTick (rotating-scope triage sweep) + stewardBridge
+  // + newsDrain (sends the next chunk of any queued newsletter campaign).
   "triggers": { "crons": ["*/5 * * * *"] },
 
   "observability": { "enabled": true }
