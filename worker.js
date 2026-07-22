@@ -205,6 +205,89 @@ async function sendMail(env,from,to,subject,text){
   if(!smtpHost)throw new Error("no smtp host for "+from);
   await smtpSend(smtpHost,cc.user,pass,from,to,subject,text);return {via:"smtp",ok:true};
 }
+// ---- Newsletter engine ----------------------------------------------------
+// You own the list; the relay is a dumb pipe. Subscribers live in YOUR KV as
+// rows (news:sub:<list>:<email>), lists are rows (news:list:<slug>), and bulk
+// sends go out through a relay (Resend) that only ever sees one email at a
+// time. Two relay modes, checked in order:
+//   1. Broker mode — RELAY_BROKER_URL (+RELAY_BROKER_REPO, RELAY_CARD) vars
+//      point at a credential-broker /agent/use door (e.g. a Fort Card wallet):
+//      the worker holds NO key, the broker injects it server-side.
+//   2. Sealed mode — POST /news/relay once with X-Relay-Key: the key is sealed
+//      (AES-GCM) into KV on arrival, same as mailbox passwords.
+// Double opt-in always; one-click unsubscribe (RFC 8058) on every send; the
+// cron drains campaigns in chunks so a big list never hits request limits.
+const EMAIL_RE=/^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const esc=(s)=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function newsListsIdx(env){const a=await env.TOKENS.get("news:lists");return a?JSON.parse(a):[];}
+async function newsGetList(env,slug){const r=await env.TOKENS.get("news:list:"+slug);return r?JSON.parse(r):null;}
+async function newsPutList(env,l){await env.TOKENS.put("news:list:"+l.slug,JSON.stringify(l));const a=await newsListsIdx(env);if(!a.includes(l.slug)){a.push(l.slug);await env.TOKENS.put("news:lists",JSON.stringify(a));}}
+async function newsGetSub(env,slug,email){const r=await env.TOKENS.get("news:sub:"+slug+":"+email);return r?JSON.parse(r):null;}
+async function newsPutSub(env,slug,s){await env.TOKENS.put("news:sub:"+slug+":"+s.email,JSON.stringify(s),{metadata:{s:s.status,ut:s.ut}});}
+async function newsRelay(env,payload){
+  if(env.RELAY_BROKER_URL&&env.RELAY_CARD){
+    const r=await fetch(env.RELAY_BROKER_URL.replace(/\/+$/,"")+"/agent/use",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({repo:env.RELAY_BROKER_REPO||"",card:env.RELAY_CARD,request:{url:"https://api.resend.com/emails",method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}})});
+    const j=await r.json().catch(()=>({}));
+    if(j.authorized===false)throw new Error("relay card declined: "+(j.decline_reason||"unknown"));
+    if(!r.ok||(typeof j.status==="number"&&j.status>=400))throw new Error("relay: broker "+r.status+" upstream "+(j.status||"?")+" "+JSON.stringify(j.body||{}).slice(0,200));
+    return j.body||{};
+  }
+  const rec=await env.TOKENS.get("news:relay");
+  if(!rec)throw new Error("no relay configured — POST /news/relay with an X-Relay-Key header, or set RELAY_BROKER_URL + RELAY_CARD");
+  const key=await unseal(env,JSON.parse(rec).sealed);
+  const r=await fetch("https://api.resend.com/emails",{method:"POST",headers:{authorization:"Bearer "+key,"content-type":"application/json"},body:JSON.stringify(payload)});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error("resend "+r.status+": "+JSON.stringify(j).slice(0,200));
+  return j;
+}
+function textToHtml(t){return (t||"").split(/\n{2,}/).map(p=>"<p>"+esc(p).replace(/\n/g,"<br>")+"</p>").join("\n");}
+function newsFooters(list,unsubUrl){return {
+  html:'<p style="font-size:12px;color:#888;margin-top:32px">You subscribed to '+esc(list.name)+'. <a href="'+unsubUrl+'">Unsubscribe</a> anytime.<br>'+esc(list.address)+'</p>',
+  text:"\n\n—\nYou subscribed to "+list.name+". Unsubscribe: "+unsubUrl+"\n"+list.address};}
+async function newsSendOne(env,list,sub,camp){
+  const unsubUrl=camp.origin+"/news/unsubscribe?u="+sub.ut;const f=newsFooters(list,unsubUrl);
+  const payload={from:list.from,to:[sub.email],subject:camp.subject,html:(camp.html||textToHtml(camp.text))+f.html,text:(camp.text||"")+f.text,headers:{"List-Unsubscribe":"<"+unsubUrl+">","List-Unsubscribe-Post":"List-Unsubscribe=One-Click"}};
+  if(list.reply_to)payload.reply_to=list.reply_to;
+  return newsRelay(env,payload);
+}
+async function newsConfirmMail(env,list,email,ct,origin){
+  const u=origin+"/news/confirm?t="+ct;
+  return newsRelay(env,{from:list.from,to:[email],subject:"Confirm your subscription to "+list.name,html:'<p>Tap to confirm you want '+esc(list.name)+':</p><p><a href="'+u+'">Yes, subscribe me</a></p><p style="font-size:12px;color:#888">If you didn’t ask for this, ignore it and nothing happens.</p>',text:"Confirm you want "+list.name+": "+u+"\n\nIf you didn't ask for this, ignore it and nothing happens."});
+}
+async function newsCounts(env,slug){
+  let cursor,total=0,confirmed=0,capped=true;
+  for(let i=0;i<5;i++){const out=await env.TOKENS.list({prefix:"news:sub:"+slug+":",cursor,limit:1000});total+=out.keys.length;for(const k of out.keys)if(k.metadata&&k.metadata.s==="confirmed")confirmed++;cursor=out.cursor;if(out.list_complete){capped=false;break;}}
+  return {total,confirmed,capped};
+}
+async function newsCampQ(env){const q=await env.TOKENS.get("news:campq");return q?JSON.parse(q):[];}
+async function newsQueue(env,camp){
+  await env.TOKENS.put("news:camp:"+camp.id,JSON.stringify(camp));
+  const q=await newsCampQ(env);q.push(camp.id);await env.TOKENS.put("news:campq",JSON.stringify(q));
+  const log=JSON.parse(await env.TOKENS.get("news:camps")||"[]");log.unshift(camp.id);await env.TOKENS.put("news:camps",JSON.stringify(log.slice(0,50)));
+}
+async function newsDrain(env){
+  const q=await newsCampQ(env);if(!q.length)return {idle:true};
+  const id=q[0];const raw=await env.TOKENS.get("news:camp:"+id);
+  if(!raw){q.shift();await env.TOKENS.put("news:campq",JSON.stringify(q));return {dropped:id};}
+  const camp=JSON.parse(raw);const list=await newsGetList(env,camp.list);
+  if(!list){camp.status="error";camp.error="list "+camp.list+" gone";q.shift();await env.TOKENS.put("news:campq",JSON.stringify(q));await env.TOKENS.put("news:camp:"+id,JSON.stringify(camp));return {id,error:camp.error};}
+  const batch=Math.max(1,parseInt(env.NEWS_BATCH||"30"));let sent=0;
+  const page=await env.TOKENS.list({prefix:"news:sub:"+camp.list+":",cursor:camp.cursor||undefined,limit:batch});
+  for(const k of page.keys){
+    if(!k.metadata||k.metadata.s!=="confirmed")continue;
+    const sub=JSON.parse(await env.TOKENS.get(k.name));if(!sub||sub.status!=="confirmed")continue;
+    try{await newsSendOne(env,list,sub,camp);sent++;}catch(e){camp.errors=(camp.errors||0)+1;camp.lastError=String((e&&e.message)||e).slice(0,300);}
+  }
+  camp.sent=(camp.sent||0)+sent;camp.cursor=page.cursor;
+  if(page.list_complete){camp.status="done";camp.done=Date.now();q.shift();await env.TOKENS.put("news:campq",JSON.stringify(q));}else camp.status="sending";
+  await env.TOKENS.put("news:camp:"+id,JSON.stringify(camp));
+  return {id,sent,errors:camp.errors||0,status:camp.status};
+}
+async function newsSuppress(env,email){
+  const hit=[];
+  for(const slug of await newsListsIdx(env)){const sub=await newsGetSub(env,slug,email);if(sub&&sub.status!=="suppressed"){sub.status="suppressed";sub.suppressed=Date.now();await newsPutSub(env,slug,sub);hit.push(slug);}}
+  return hit;
+}
 async function triageGmail(env,email){const items=await gmailRecent(env,email,20);return {source:"gmail",scanned:items.length,desk:items.filter(i=>i.verdict==="desk"),record:items.filter(i=>i.verdict==="record"),ignored:items.filter(i=>i.verdict==="ignore").length};}
 async function triageBox(env,addr){const c=JSON.parse(await env.TOKENS.get("imap:"+addr));const pass=await unseal(env,c.sealed);const {total,recent,items}=await imapHeaders(c.host,c.user,pass,10);const tagged=items.map(i=>({...i,verdict:verdict(env,i.from,i.subject,"",i.unsub)}));return {source:"imap",total,recent,scanned:items.length,desk:tagged.filter(i=>i.verdict==="desk"),record:tagged.filter(i=>i.verdict==="record"),ignored:tagged.filter(i=>i.verdict==="ignore").length};}
 async function runScope(env,scopeKey){
@@ -221,7 +304,10 @@ const TOOLS=[
   {name:"triage",description:"Run a live triage of one scope. scope='gmail' or an IMAP domain (e.g. 'example.com').",inputSchema:{type:"object",properties:{scope:{type:"string"}},required:["scope"]}},
   {name:"read_box",description:"Read recent (90d) message headers from one mailbox (gmail or IMAP address). Each item includes a uid/id you can pass to read_message for the full body.",inputSchema:{type:"object",properties:{address:{type:"string"},count:{type:"number"}},required:["address"]}},
   {name:"read_message",description:"Read the FULL body of one message. For an IMAP address pass the item's uid (from read_box/triage); for a Gmail address pass the item's id.",inputSchema:{type:"object",properties:{address:{type:"string"},uid:{type:"string"}},required:["address","uid"]}},
-  {name:"send",description:"Send an email AS any owned mailbox (Gmail or IMAP) — picks transport automatically.",inputSchema:{type:"object",properties:{from:{type:"string"},to:{type:"string"},subject:{type:"string"},text:{type:"string"}},required:["from","to","subject","text"]}}
+  {name:"send",description:"Send an email AS any owned mailbox (Gmail or IMAP) — picks transport automatically.",inputSchema:{type:"object",properties:{from:{type:"string"},to:{type:"string"},subject:{type:"string"},text:{type:"string"}},required:["from","to","subject","text"]}},
+  {name:"news_lists",description:"Newsletter: all lists with subscriber counts (total/confirmed).",inputSchema:{type:"object",properties:{}}},
+  {name:"news_send",description:"Newsletter: queue a campaign to a list (drained in chunks by the cron), or set test to an email address to smoke-test to that one address only.",inputSchema:{type:"object",properties:{list:{type:"string"},subject:{type:"string"},text:{type:"string"},html:{type:"string"},test:{type:"string"}},required:["list","subject"]}},
+  {name:"news_status",description:"Newsletter: recent campaigns and the pending queue; pass id for one campaign's full state.",inputSchema:{type:"object",properties:{id:{type:"string"}}}}
 ];
 async function callTool(env,name,args){
   args=args||{};
@@ -231,6 +317,21 @@ async function callTool(env,name,args){
   if(name==="read_box"){const a=args.address,n=args.count||10;if((await listAccounts(env)).includes(a))return {address:a,messages:await gmailRecent(env,a,n)};const c=await env.TOKENS.get("imap:"+a);if(!c)throw new Error("unknown mailbox "+a);const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);const {total,recent,items}=await imapHeaders(cc.host,cc.user,pass,n);return {address:a,total,recent,messages:items};}
   if(name==="read_message"){const a=args.address,uid=String(args.uid||"");if(!uid)throw new Error("uid required");if((await listAccounts(env)).includes(a))return {address:a,...await gmailMessageBody(env,a,uid)};const c=await env.TOKENS.get("imap:"+a);if(!c)throw new Error("unknown mailbox "+a);const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);return {address:a,...await imapReadMessage(cc.host,cc.user,pass,uid)};}
   if(name==="send")return await sendMail(env,args.from,args.to,args.subject,args.text);
+  if(name==="news_lists"){const out=[];for(const slug of await newsListsIdx(env)){const l=await newsGetList(env,slug);if(l)out.push({...l,subscribers:await newsCounts(env,slug)});}return {lists:out};}
+  if(name==="news_send"){
+    const list=await newsGetList(env,args.list);if(!list)throw new Error("unknown list "+args.list);
+    if(!args.subject||(!args.html&&!args.text))throw new Error("need subject and html or text");
+    const origin="https://"+(env.PUBLIC_HOST||"");if(!env.PUBLIC_HOST)throw new Error("set the PUBLIC_HOST var (this worker's public hostname) so unsubscribe links in MCP-queued campaigns resolve");
+    if(args.test){if(!EMAIL_RE.test(args.test))throw new Error("bad test address");return {test:args.test,relay:await newsSendOne(env,list,{email:args.test,ut:"test",status:"confirmed"},{origin,subject:"[TEST] "+args.subject,html:args.html,text:args.text})};}
+    const camp={id:tok(12),list:list.slug,subject:args.subject,html:args.html||"",text:args.text||"",origin,created:Date.now(),status:"queued",cursor:null,sent:0,errors:0};
+    await newsQueue(env,camp);return {queued:camp.id};
+  }
+  if(name==="news_status"){
+    if(args.id){const c=await env.TOKENS.get("news:camp:"+args.id);if(!c)throw new Error("unknown campaign");return JSON.parse(c);}
+    const log=JSON.parse(await env.TOKENS.get("news:camps")||"[]");const out=[];
+    for(const cid of log.slice(0,10)){const c=await env.TOKENS.get("news:camp:"+cid);if(c){const j=JSON.parse(c);out.push({id:j.id,list:j.list,subject:j.subject,status:j.status,sent:j.sent,errors:j.errors});}}
+    return {campaigns:out,pending:await newsCampQ(env)};
+  }
   throw new Error("unknown tool "+name);
 }
 async function mcpHandle(env,req){
@@ -243,14 +344,14 @@ async function mcpHandle(env,req){
   return {jsonrpc:"2.0",id,error:{code:-32601,message:"method not found: "+m}};
 }
 export default {
-  async scheduled(event,env,ctx){ ctx.waitUntil((async()=>{try{await cronTick(env);}catch(e){}try{await stewardBridge(env,false);}catch(e){}})()); },
+  async scheduled(event,env,ctx){ ctx.waitUntil((async()=>{try{await cronTick(env);}catch(e){}try{await stewardBridge(env,false);}catch(e){}try{await newsDrain(env);}catch(e){}})()); },
   async fetch(request,env){
     const url=new URL(request.url);
     const path=url.pathname.replace(/\/+$/,"")||"/";
     const okKey=env.TRIGGER_KEY&&url.searchParams.get("key")===env.TRIGGER_KEY;
     const redirectUri=url.origin+"/oauth/callback";const origin=url.origin;
     if(request.method==="OPTIONS")return new Response(null,{headers:{"access-control-allow-origin":"*","access-control-allow-methods":"GET,POST,OPTIONS","access-control-allow-headers":"authorization,content-type"}});
-    if(path==="/") return html('<h2>Fortmail</h2><p>Agent-operated email. Your agent connects at <code>/mcp</code>.</p><p><a href="https://github.com/TheFortThatHolds/mail">Source &amp; setup</a></p>');
+    if(path==="/") return html('<h2>Fortmail</h2><p>Agent-operated email. Your agent connects at <code>/mcp</code>.</p><p>Newsletter engine included — you own the list, the relay is a dumb pipe. See docs/NEWSLETTER.md.</p><p><a href="https://github.com/TheFortThatHolds/mail">Source &amp; setup</a></p>');
     if(path==="/.well-known/oauth-authorization-server"||path==="/.well-known/openid-configuration")
       return json({issuer:origin,authorization_endpoint:origin+"/authorize",token_endpoint:origin+"/token",registration_endpoint:origin+"/register",response_types_supported:["code"],grant_types_supported:["authorization_code","refresh_token"],code_challenge_methods_supported:["S256"],token_endpoint_auth_methods_supported:["none"],scopes_supported:["mail"]});
     if(path==="/.well-known/oauth-protected-resource")return json({resource:origin+"/mcp",authorization_servers:[origin]});
@@ -322,6 +423,113 @@ export default {
       if(scope==="all"||scope==="gmail"){for(const email of await listAccounts(env))jobs.push(triageGmail(env,email).then(r=>{out[email]=r;}).catch(e=>{out[email]={error:String((e&&e.message)||e)};}));}
       if(scope==="all"||scope==="imap"){for(const addr of await listImap(env)){if(domain&&!addr.endsWith("@"+domain))continue;jobs.push(triageBox(env,addr).then(r=>{out[addr]=r;}).catch(e=>{out[addr]={source:"imap",error:String((e&&e.message)||e)};}));}}
       await Promise.all(jobs);return json({ok:true,results:out});
+    }
+    // ---- Newsletter routes (public ones first, then key-gated admin) ----
+    if(path==="/news/subscribe"&&request.method==="GET"){
+      const slug=(url.searchParams.get("list")||"").trim();const list=slug?await newsGetList(env,slug):null;
+      if(!list) return html("<p>Unknown list.</p>");
+      return html('<h3>'+esc(list.name)+'</h3><form method="POST" action="/news/subscribe"><input type="hidden" name="list" value="'+esc(slug)+'"/><input type="text" name="website" style="display:none" tabindex="-1" autocomplete="off"/><input name="email" type="email" placeholder="you@example.com" required autofocus/> <button>Subscribe</button></form><p style="font-size:12px;color:#888">Double opt-in — we send one confirmation email, nothing until you click it.</p>');
+    }
+    if(path==="/news/subscribe"&&request.method==="POST"){
+      let p={};const ct=request.headers.get("content-type")||"";
+      if(ct.includes("json"))p=await request.json().catch(()=>({}));else{const f=await request.formData().catch(()=>null);if(f)p={list:f.get("list"),email:f.get("email"),website:f.get("website"),src:f.get("src")};}
+      if((p.website||"").trim()) return html("<p>Thanks!</p>"); // honeypot: pretend success
+      const slug=(p.list||"").trim(),email=(p.email||"").trim().toLowerCase();
+      const list=slug?await newsGetList(env,slug):null;
+      if(!list) return json({ok:false,error:"unknown list"},400);
+      if(!EMAIL_RE.test(email)) return json({ok:false,error:"invalid email"},400);
+      const existing=await newsGetSub(env,slug,email);
+      if(existing&&existing.status==="confirmed") return html("<p>You're already subscribed to "+esc(list.name)+". Nothing to do.</p>");
+      if(await env.TOKENS.get("news:ctlock:"+slug+":"+email)) return html("<p>Check your inbox — a confirmation email is already on its way.</p>");
+      const sub=existing||{email,ut:tok(24),created:Date.now()};sub.status="pending";sub.src=p.src||sub.src||"web";
+      await newsPutSub(env,slug,sub);await env.TOKENS.put("news:ut:"+sub.ut,JSON.stringify({list:slug,email}));
+      const c=tok(24);await env.TOKENS.put("news:ct:"+c,JSON.stringify({list:slug,email}),{expirationTtl:172800});
+      await env.TOKENS.put("news:ctlock:"+slug+":"+email,"1",{expirationTtl:600});
+      try{await newsConfirmMail(env,list,email,c,url.origin);}catch(e){return json({ok:false,error:"could not send confirmation: "+String((e&&e.message)||e)},500);}
+      return html("<p>Almost there — check your inbox and click the confirmation link.</p>");
+    }
+    if(path==="/news/confirm"){
+      const t=url.searchParams.get("t")||"";const raw=t&&await env.TOKENS.get("news:ct:"+t);
+      if(!raw) return html("<p>That confirmation link is expired or already used. Subscribe again to get a fresh one.</p>");
+      const {list:slug,email}=JSON.parse(raw);const sub=await newsGetSub(env,slug,email);const list=await newsGetList(env,slug);
+      if(sub){sub.status="confirmed";sub.confirmed=Date.now();await newsPutSub(env,slug,sub);}
+      await env.TOKENS.delete("news:ct:"+t);
+      return html("<h3>You're in ✓</h3><p>"+esc(email)+" is subscribed to "+esc(list?list.name:slug)+".</p>");
+    }
+    if(path==="/news/unsubscribe"){
+      const u=url.searchParams.get("u")||"";const raw=u&&await env.TOKENS.get("news:ut:"+u);
+      if(!raw) return html("<p>Unknown unsubscribe link.</p>");
+      const {list:slug,email}=JSON.parse(raw);
+      if(request.method==="POST"){ // one-click (RFC 8058) and the button below both land here
+        const sub=await newsGetSub(env,slug,email);
+        if(sub&&sub.status!=="unsubscribed"){sub.status="unsubscribed";sub.unsubscribed=Date.now();await newsPutSub(env,slug,sub);}
+        return html("<p>"+esc(email)+" is unsubscribed. Done — no more emails from this list.</p>");
+      }
+      return html('<h3>Unsubscribe</h3><p>Remove '+esc(email)+' from this list?</p><form method="POST"><button>Yes, unsubscribe</button></form>');
+    }
+    if(path==="/news/hook"&&request.method==="POST"){ // relay webhook: hard bounces + complaints suppress everywhere
+      if(env.NEWS_HOOK_SECRET&&url.searchParams.get("s")!==env.NEWS_HOOK_SECRET) return new Response("unauthorized",{status:401});
+      const ev=await request.json().catch(()=>null);
+      if(!ev||!ev.type) return json({ok:false},400);
+      if(ev.type==="email.bounced"||ev.type==="email.complained"){const to=(((ev.data||{}).to)||[])[0]||"";if(to)return json({ok:true,suppressed:await newsSuppress(env,to.toLowerCase())});}
+      return json({ok:true,ignored:ev.type});
+    }
+    if(path==="/news/relay"&&request.method==="POST"){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      const key=request.headers.get("x-relay-key")||"";
+      if(!key) return json({ok:false,error:"send the relay API key in the X-Relay-Key header — it is sealed on arrival, never stored in plain"});
+      await env.TOKENS.put("news:relay",JSON.stringify({type:"resend",sealed:await seal(env,key)}));
+      return json({ok:true,relay:"resend",sealed:true});
+    }
+    if(path==="/news/list"&&request.method==="POST"){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      const p=await request.json().catch(()=>({}));
+      const slug=(p.slug||"").trim().toLowerCase();
+      if(!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) return json({ok:false,error:"slug: a-z 0-9 dashes"},400);
+      if(!p.name||!p.from) return json({ok:false,error:"need name and from (e.g. \"Pen Name <news@your-domain.com>\")"},400);
+      if(!p.address) return json({ok:false,error:"need address — a physical mailing address is legally required in every send (CAN-SPAM)"},400);
+      const prev=await newsGetList(env,slug);
+      const list={slug,name:p.name,from:p.from,reply_to:p.reply_to||"",address:p.address,created:(prev&&prev.created)||Date.now()};
+      await newsPutList(env,list);return json({ok:true,list});
+    }
+    if(path==="/news/lists"){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      const out=[];for(const slug of await newsListsIdx(env)){const l=await newsGetList(env,slug);if(l)out.push({...l,subscribers:await newsCounts(env,slug)});}
+      return json({ok:true,lists:out});
+    }
+    if(path==="/news/subscribers"){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      const slug=(url.searchParams.get("list")||"").trim();if(!slug) return json({ok:false,error:"need ?list="},400);
+      const page=await env.TOKENS.list({prefix:"news:sub:"+slug+":",cursor:url.searchParams.get("cursor")||undefined,limit:200});
+      return json({ok:true,list:slug,subscribers:page.keys.map(k=>({email:k.name.slice(("news:sub:"+slug+":").length),status:(k.metadata||{}).s||"?"})),cursor:page.list_complete?null:page.cursor});
+    }
+    if(path==="/news/send"&&request.method==="POST"){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      const p=await request.json().catch(()=>({}));
+      const list=p.list?await newsGetList(env,p.list):null;
+      if(!list) return json({ok:false,error:"unknown list"},400);
+      if(!p.subject||(!p.html&&!p.text)) return json({ok:false,error:"need subject and html or text"},400);
+      if(p.test){ // smoke-test to one address, never touches the list
+        if(!EMAIL_RE.test(p.test)) return json({ok:false,error:"bad test address"},400);
+        const fake={email:p.test,ut:"test",status:"confirmed"};
+        const out=await newsSendOne(env,list,fake,{origin:url.origin,subject:"[TEST] "+p.subject,html:p.html,text:p.text});
+        return json({ok:true,test:p.test,relay:out});
+      }
+      const camp={id:tok(12),list:list.slug,subject:p.subject,html:p.html||"",text:p.text||"",origin:url.origin,created:Date.now(),status:"queued",cursor:null,sent:0,errors:0};
+      await newsQueue(env,camp);
+      return json({ok:true,queued:camp.id,note:"the cron drains it in chunks of NEWS_BATCH (default 30) every tick; GET /news/campaign?id="+camp.id+" for progress, GET /news/drain to push it along now"});
+    }
+    if(path==="/news/campaign"){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      const id=url.searchParams.get("id");
+      if(id){const c=await env.TOKENS.get("news:camp:"+id);return c?json({ok:true,campaign:JSON.parse(c)}):json({ok:false,error:"unknown campaign"},404);}
+      const log=JSON.parse(await env.TOKENS.get("news:camps")||"[]");const out=[];
+      for(const cid of log.slice(0,10)){const c=await env.TOKENS.get("news:camp:"+cid);if(c){const j=JSON.parse(c);out.push({id:j.id,list:j.list,subject:j.subject,status:j.status,sent:j.sent,errors:j.errors,created:j.created});}}
+      return json({ok:true,campaigns:out,pending:await newsCampQ(env)});
+    }
+    if(path==="/news/drain"){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      return json({ok:true,...await newsDrain(env)});
     }
     if(!env.GMAIL_CLIENT_ID||!env.GMAIL_CLIENT_SECRET) return json({ok:false,need:"set GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET on this worker to use Gmail endpoints"});
     if(path==="/import"){

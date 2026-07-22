@@ -48,6 +48,13 @@ ask for exactly that thing, then continue.
 9. **Connect the operating agent.** Add `<worker-url>/mcp` to whatever MCP
    client the operator uses (`docs/SETUP.md` §4). The OAuth password prompt
    is the `TRIGGER_KEY`.
+10. **Newsletter engine** (optional — `docs/NEWSLETTER.md`). **[HUMAN]** verify
+    the sending domain in Resend (DKIM records). Then pick a relay mode:
+    broker vars (`RELAY_BROKER_URL`/`RELAY_BROKER_REPO`/`RELAY_CARD` — key
+    never touches this worker) or **[HUMAN]** hand the Resend key once to
+    `POST /news/relay` (X-Relay-Key header; sealed on arrival). Create a list
+    via `POST /news/list`, smoke-test with `POST /news/send` + `test`, and
+    add the Resend webhook (`/news/hook`, bounced + complained events).
 
 ## Rules while working in this repo
 
