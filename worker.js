@@ -307,7 +307,12 @@ const TOOLS=[
   {name:"send",description:"Send an email AS any owned mailbox (Gmail or IMAP) — picks transport automatically.",inputSchema:{type:"object",properties:{from:{type:"string"},to:{type:"string"},subject:{type:"string"},text:{type:"string"}},required:["from","to","subject","text"]}},
   {name:"news_lists",description:"Newsletter: all lists with subscriber counts (total/confirmed).",inputSchema:{type:"object",properties:{}}},
   {name:"news_send",description:"Newsletter: queue a campaign to a list (drained in chunks by the cron), or set test to an email address to smoke-test to that one address only.",inputSchema:{type:"object",properties:{list:{type:"string"},subject:{type:"string"},text:{type:"string"},html:{type:"string"},test:{type:"string"}},required:["list","subject"]}},
-  {name:"news_status",description:"Newsletter: recent campaigns and the pending queue; pass id for one campaign's full state.",inputSchema:{type:"object",properties:{id:{type:"string"}}}}
+  {name:"news_status",description:"Newsletter: recent campaigns and the pending queue; pass id for one campaign's full state.",inputSchema:{type:"object",properties:{id:{type:"string"}}}},
+  // Create/update a list. The HTTP route (/news/list) is gated on TRIGGER_KEY, so a list
+  // could only be born from a shell holding the key. This door is already admin —
+  // news_send can blast an entire list — so exposing create here is consistent, not an
+  // escalation. Same validation as the HTTP route, including the CAN-SPAM postal address.
+  {name:"news_list_create",description:"Newsletter: create or update a list. slug is lowercase a-z 0-9 dashes. from is a full From header (e.g. \"The Fort <fort@example.com>\"). address is the physical mailing address REQUIRED by CAN-SPAM in every send. Re-running with an existing slug updates it and preserves its created date and subscribers.",inputSchema:{type:"object",properties:{slug:{type:"string"},name:{type:"string"},from:{type:"string"},reply_to:{type:"string"},address:{type:"string"}},required:["slug","name","from","address"]}}
 ];
 async function callTool(env,name,args){
   args=args||{};
@@ -318,6 +323,16 @@ async function callTool(env,name,args){
   if(name==="read_message"){const a=args.address,uid=String(args.uid||"");if(!uid)throw new Error("uid required");if((await listAccounts(env)).includes(a))return {address:a,...await gmailMessageBody(env,a,uid)};const c=await env.TOKENS.get("imap:"+a);if(!c)throw new Error("unknown mailbox "+a);const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);return {address:a,...await imapReadMessage(cc.host,cc.user,pass,uid)};}
   if(name==="send")return await sendMail(env,args.from,args.to,args.subject,args.text);
   if(name==="news_lists"){const out=[];for(const slug of await newsListsIdx(env)){const l=await newsGetList(env,slug);if(l)out.push({...l,subscribers:await newsCounts(env,slug)});}return {lists:out};}
+  if(name==="news_list_create"){
+    const slug=String(args.slug||"").trim().toLowerCase();
+    if(!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug))throw new Error("slug: a-z 0-9 dashes, starting with a letter or digit");
+    if(!args.name||!args.from)throw new Error('need name and from (e.g. "The Fort <fort@example.com>")');
+    if(!args.address)throw new Error("need address — a physical mailing address is legally required in every send (CAN-SPAM)");
+    const prev=await newsGetList(env,slug);
+    const list={slug,name:args.name,from:args.from,reply_to:args.reply_to||"",address:args.address,created:(prev&&prev.created)||Date.now()};
+    await newsPutList(env,list);
+    return {ok:true,created:!prev,list,subscribers:await newsCounts(env,slug)};
+  }
   if(name==="news_send"){
     const list=await newsGetList(env,args.list);if(!list)throw new Error("unknown list "+args.list);
     if(!args.subject||(!args.html&&!args.text))throw new Error("need subject and html or text");
