@@ -155,6 +155,13 @@ consequential, gate on your explicit approval, not on a From header.
 
 Hardening ideas, threat model, and known limits: [docs/SECURITY.md](docs/SECURITY.md).
 
+## Where this came from
+
+Fortmail is one organ of [The Fort That Holds](https://thefortthatholds.com) — a sovereign,
+agent-operated stack built by one person in the open. The other pieces that have been
+generalized and released the same way, plus the written routes for building them yourself,
+are at [thefortthatholds.xyz](https://thefortthatholds.xyz).
+
 ## License
 
 [MIT](LICENSE) © The Fort That Holds LLC.
