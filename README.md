@@ -158,9 +158,23 @@ Hardening ideas, threat model, and known limits: [docs/SECURITY.md](docs/SECURIT
 ## Where this came from
 
 Fortmail is one organ of [The Fort That Holds](https://thefortthatholds.com) — a sovereign,
-agent-operated stack built by one person in the open. The other pieces that have been
-generalized and released the same way, plus the written routes for building them yourself,
-are at [thefortthatholds.xyz](https://thefortthatholds.xyz).
+agent-operated stack built in the open. This repository is the whole mail tool. It is
+MIT-licensed and free to run. There is no Fortmail product page and no paid mail seed.
+
+If you want the written *route* for other Fort pieces — the instructions you hand your
+own agent so it can walk a path that already worked — those live on the
+[Grand Bazaar](https://thefortthatholds.xyz) as [Selfware Seeds](https://thefortthatholds.xyz)
+(the rack is on the front page). Live ones today:
+
+- [LOCUS Symbiote](https://thefortthatholds.xyz/locus-products)
+- [Sovereign Web](https://thefortthatholds.xyz/sovereign-products)
+- [Digital Asset Vault](https://thefortthatholds.xyz/business-solutions)
+- [Beta Reader](https://thefortthatholds.xyz/digital-products) — and a hosted
+  [Beta Reader Pass](https://thefortthatholds.xyz/braided-ink-beta-pass) if you'd rather
+  not self-host that one
+
+Agents can read the same list as [catalog.json](https://thefortthatholds.xyz/catalog.json).
+None of that is required to run Fortmail.
 
 ## License
 
