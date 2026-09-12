@@ -34,7 +34,8 @@ your domain(s) ─┤→  Fortmail worker  →  triage desk (only what matters)
   own harness) and it gets the mail tools (`list_accounts`, `get_desk`,
   `triage`, `read_box`, `read_message`, `get_attachment`, `send`) plus the
   newsletter tools. `read_message` returns body text and attachment metadata;
-  `get_attachment` / `GET /attachment` fetch Gmail file bytes. There is
+  `get_attachment` / `GET /attachment` fetch Gmail file bytes by `filename`
+  (preferred) or `attachmentId`. There is
   **no LLM inside Fortmail itself** — no model dependency, no API key to
   any AI vendor; the intelligence is whatever agent you point at it.
 - **Sends as anyone you own.** Gmail via the API, everything else via SMTP —
@@ -129,7 +130,7 @@ consequential, gate on your explicit approval, not on a From header.
 | `/wallet-import?key=&addr=&host=&smtp=` | Seal an existing password (via `X-Mailbox-Password` header) |
 | `/accounts?key=` / `/imapboxes?key=` | List owned boxes |
 | `/tool?key=&name=` | Call any MCP tool over HTTP (`GET` query or `POST` JSON `{name,arguments}`) — same `TRIGGER_KEY` as `/accounts` |
-| `/attachment?key=&address=&message=&attachmentId=` | Fetch one Gmail attachment as raw bytes (`Content-Type` from the part). `encoding=base64` returns JSON instead. Read-only; 4MB cap on JSON/tool payloads |
+| `/attachment?key=&address=&message=&filename=` | Fetch one Gmail attachment as raw bytes (`Content-Type` from the part). `filename` (preferred) or `attachmentId`. `encoding=base64` returns JSON instead. Read-only; 4MB cap on JSON/tool payloads |
 | `/connect?key=` → `/oauth/callback` | Gmail account OAuth flow |
 | `/import?key=` | Import an existing Gmail refresh token |
 | `/bridge-run?key=&dry=1` | Run/inspect the steward bridge now |

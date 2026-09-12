@@ -11,6 +11,7 @@
 //
 // Open source (MIT) from The Fort That Holds LLC. See README.md for setup.
 import { connect } from "cloudflare:sockets";
+import { WorkerEntrypoint } from "cloudflare:workers";
 const SCOPE = "https://mail.google.com/";
 const QUERY = "in:inbox newer_than:90d";
 const DAYS=90;
@@ -34,6 +35,11 @@ async function seal(env,plain){const key=await walletKey(env);const iv=crypto.ge
 async function unseal(env,blob){const key=await walletKey(env);const[a,b]=blob.split(":");const pt=await crypto.subtle.decrypt({name:"AES-GCM",iv:ub64(a)},key,ub64(b));return new TextDecoder().decode(pt);}
 function genpw(){return b64(crypto.getRandomValues(new Uint8Array(18))).replace(/[+/=]/g,"")+"Aa7";}
 async function exchangeCode(env,code,redirectUri){const b=new URLSearchParams({client_id:env.GMAIL_CLIENT_ID,client_secret:env.GMAIL_CLIENT_SECRET,code,redirect_uri:redirectUri,grant_type:"authorization_code"});const r=await fetch("https://oauth2.googleapis.com/token",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:b});if(!r.ok)throw new Error("token exchange "+r.status+": "+(await r.text()).slice(0,300));return r.json();}
+// Human approval for the MCP door uses the already-configured owner identity.
+// TRIGGER_KEY remains a machine/admin gate; it is never a password Jimmy must remember.
+async function googleIdentity(accessToken){const r=await fetch("https://openidconnect.googleapis.com/v1/userinfo",{headers:{authorization:"Bearer "+accessToken}});if(!r.ok)throw new Error("owner identity "+r.status+": "+(await r.text()).slice(0,200));return r.json();}
+function isOwnerEmail(env,email){const needle=String(email||"").trim().toLowerCase();return !!needle&&(env.OWNER_EMAILS||"").split(",").map(s=>s.trim().toLowerCase()).filter(Boolean).includes(needle);}
+function ownerSignInUrl(env,redirectUri,state){const auth=new URL("https://accounts.google.com/o/oauth2/v2/auth");auth.searchParams.set("client_id",env.GMAIL_CLIENT_ID);auth.searchParams.set("redirect_uri",redirectUri);auth.searchParams.set("response_type","code");auth.searchParams.set("scope","openid email");auth.searchParams.set("access_type","online");auth.searchParams.set("prompt","select_account");auth.searchParams.set("state",state);return auth.toString();}
 async function refreshTok(env,refreshToken){const b=new URLSearchParams({client_id:env.GMAIL_CLIENT_ID,client_secret:env.GMAIL_CLIENT_SECRET,refresh_token:refreshToken,grant_type:"refresh_token"});const r=await fetch("https://oauth2.googleapis.com/token",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:b});if(!r.ok)throw new Error("refresh "+r.status+": "+(await r.text()).slice(0,300));return (await r.json()).access_token;}
 async function gapi(at,path,init){const r=await fetch("https://gmail.googleapis.com/gmail/v1"+path,{...(init||{}),headers:{authorization:"Bearer "+at,...((init&&init.headers)||{})}});if(!r.ok)throw new Error("gmail "+r.status+": "+(await r.text()).slice(0,300));return r.json();}
 async function listAccounts(env){const a=await env.TOKENS.get("accounts");return a?JSON.parse(a):[];}
@@ -173,6 +179,12 @@ async function stewardBridgeOne(env,watch,dry){
     const bodyText=full&&full.body?full.body:"(body fetch failed — call Fortmail `read_message(address:\""+watch+"\", uid:\""+it.uid+"\")` to retry)";
     const body=banner+"\n\n**From:** "+it.from+"\n**Date:** "+it.date+"\n**To:** "+watch+"\n**Sender trust:** "+(trusted?"OWNER":"UNTRUSTED")+"\n\n---\n\n"+bodyText+"\n\n---\n\nAgent: act on this per the trust banner above (sort/file/draft/respond as appropriate). Hold any outbound for the owner's approval unless pre-authorized.\n\n— filed automatically by the Fortmail bridge";
     const branch="mail-"+it.uid+"-"+(trusted?"o":"x");const num=await ghPR(env,branch,"[mail] "+(it.subject||"(no subject)"),body);done.push({uid:it.uid,pr:num,repo:env.GITHUB_REPO,trusted});
+    // RING THE FORT'S OWN STEWARD (2026-09-02). The PR above used to be the wake for a
+    // Claude-hosted Routine; Jimmy is deleting every one of those. The rail runs the
+    // mail-steward template on Jimmy's Cloudflare — lanes are the rail's code, so this
+    // call cannot widen anything; it only hands over the filed message. The PR stays as
+    // the audit envelope. A rail outage never stops the filing (try/catch, per-item).
+    if(env.RAIL&&typeof env.RAIL.act==="function"){try{const r=await env.RAIL.act("run",{template:"mail-steward",brief:"UID: "+it.uid+" · PR #"+num+" in "+env.GITHUB_REPO+" · mailbox: "+watch+"\n\n"+body});done[done.length-1].rail=r&&r.ok?"ran":("refused: "+String((r&&r.error)||"?").slice(0,120));}catch(e){done[done.length-1].rail="error: "+String((e&&e.message)||e).slice(0,120);}}
   }catch(e){errors.push(String((e&&e.message)||e));}}
   if(done.length)await imapMarkSeen(cc.host,cc.user,pass,done.map(d=>d.uid));
   return {watch,repo:env.GITHUB_REPO,ticketed:done.length,done,errors};
@@ -183,9 +195,9 @@ async function stewardBridge(env,dry){
   const results=await Promise.all(boxes.map(w=>stewardBridgeOne(env,w,dry)));
   return boxes.length===1?results[0]:{boxes:results};
 }
-async function gmailRecent(env,email,n){
+async function gmailRecent(env,email,n,q){
   const rt=await env.TOKENS.get("gmail:"+email);const at=await refreshTok(env,rt);
-  const list=await gapi(at,"/users/me/messages?maxResults="+n+"&q="+encodeURIComponent(QUERY));
+  const list=await gapi(at,"/users/me/messages?maxResults="+Math.min(Math.max(1,n|0),500)+"&q="+encodeURIComponent(q||QUERY));
   const ids=(list.messages||[]).map(m=>m.id);const items=[];
   for(const id of ids){const m=await gapi(at,"/users/me/messages/"+id+"?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe");const h=(m.payload&&m.payload.headers)||[];const g=x=>{const y=h.find(z=>z.name.toLowerCase()===x);return y?y.value:"";};const from=g("from"),subj=g("subject"),snip=m.snippet||"",unsub=!!g("list-unsubscribe");items.push({id,from,subject:subj,date:g("date"),snippet:snip,verdict:verdict(env,from,subj,snip,unsub)});}
   return items;
@@ -198,7 +210,6 @@ function gmailWalkPart(part){
   return "";
 }
 // Gmail format=full already has filename / mimeType / body.attachmentId / size.
-// The old walk only returned text; this collects file parts without fetching bytes.
 function gmailWalkAttachments(part,out){
   if(!part)return;
   const fn=part.filename||"";
@@ -247,6 +258,26 @@ async function gmailGetAttachment(env,email,messageId,attachmentId,filename){
   const att=await gapi(at,"/users/me/messages/"+encodeURIComponent(messageId)+"/attachments/"+encodeURIComponent(aid));
   const bytes=b64urlToBytes(att.data||"");
   return {id:m.id||messageId,filename:part.filename||"unnamed",mimeType:part.mimeType||"application/octet-stream",size:att.size||bytes.length,bytes};
+}
+// Archive Gmail messages — remove INBOX (and UNREAD) without deleting anything. By ids, or by a
+// Gmail search capped at 100 so a loose query can never sweep a whole mailbox. Gmail only: the
+// IMAP boxes are Migadu's and have no label model; this is the inbox-clearing verb the Fort
+// lacked on 2026-09-02 (seven "Run failed" CI emails, and no Fort hand to clear them).
+async function gmailArchive(env,email,ids,q){
+  const rt=await env.TOKENS.get("gmail:"+email);if(!rt)throw new Error("unknown account "+email);const at=await refreshTok(env,rt);
+  let targets=Array.isArray(ids)?ids.map(String).filter(Boolean):[];
+  if(!targets.length){
+    if(!q)throw new Error("give ids or a Gmail query");
+    const list=await gapi(at,"/users/me/messages?maxResults=100&q="+encodeURIComponent(q));
+    targets=(list.messages||[]).map(m=>m.id);
+  }
+  if(!targets.length)return {address:email,archived:0,ids:[]};
+  // batchModify answers 204 with an EMPTY body — gapi()'s r.json() throws on it AFTER the
+  // labels have already been removed (measured 2026-09-02: the seven CI emails left the
+  // inbox and the call still reported "Unexpected end of JSON input"). Call fetch directly.
+  const r=await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify",{method:"POST",headers:{authorization:"Bearer "+at,"content-type":"application/json"},body:JSON.stringify({ids:targets,removeLabelIds:["INBOX","UNREAD"]})});
+  if(!r.ok)throw new Error("gmail batchModify "+r.status+": "+(await r.text()).slice(0,300));
+  return {address:email,archived:targets.length,ids:targets};
 }
 async function sendGmail(env,account,to,subject,text){
   const rt=await env.TOKENS.get("gmail:"+account);if(!rt)throw new Error("unknown account "+account);
@@ -364,23 +395,46 @@ async function runScope(env,scopeKey){
   else{const boxes=(await listImap(env)).filter(a=>a.endsWith("@"+scopeKey));for(let i=0;i<boxes.length;i+=4){const chunk=boxes.slice(i,i+4);const res=await Promise.all(chunk.map(a=>triageBox(env,a).then(r=>({a,r})).catch(()=>null)));for(const x of res){if(x&&x.r)for(const it of x.r.desk)desk.push({box:x.a,source:"imap",subject:it.subject,from:it.from,date:it.date});}}}
   await env.TOKENS.put("desk:"+scopeKey,JSON.stringify({ts:Date.now(),scope:scopeKey,desk}));return desk;
 }
-async function cronTick(env){const scopes=await getScopes(env);const cur=parseInt(await env.TOKENS.get("cron_cursor")||"0");const scopeKey=scopes[cur%scopes.length];await env.TOKENS.put("cron_cursor",String((cur+1)%scopes.length));return {scope:scopeKey,desk:await runScope(env,scopeKey)};}
-async function readDesk(env){const scopes={};let items=[];for(const sk of await getScopes(env)){const d=await env.TOKENS.get("desk:"+sk);if(d){const j=JSON.parse(d);scopes[sk]={updated:j.ts,count:j.desk.length};items=items.concat(j.desk);}else scopes[sk]={updated:null,count:0};}return {scopes,desk:items};}
+// build-item-102 / todos 5fb1f066+0b1ae23a: a scope going stale used to be indistinguishable
+// from "hasn't had its turn yet" -- runScope's own per-mailbox failures were already caught,
+// but a throw ABOVE that (getScopes/listImap, a KV hiccup) killed the whole tick silently,
+// leaving desk:<scope> simply un-updated with no trace of why. Now every failure path writes
+// a real marker (timestamp + error text) instead of leaving nothing behind, so the NEXT time
+// this happens it's diagnosable in the record instead of requiring a live-credential investigation.
+async function cronTick(env){
+  let scopes,cur;
+  try{scopes=await getScopes(env);cur=parseInt(await env.TOKENS.get("cron_cursor")||"0");}
+  catch(e){await env.TOKENS.put("cron:lasterror",JSON.stringify({ts:Date.now(),where:"getScopes",error:String((e&&e.message)||e)}));throw e;}
+  const scopeKey=scopes[cur%scopes.length];
+  await env.TOKENS.put("cron_cursor",String((cur+1)%scopes.length));
+  try{return {scope:scopeKey,desk:await runScope(env,scopeKey)};}
+  catch(e){
+    const err=String((e&&e.message)||e);
+    await env.TOKENS.put("desk:"+scopeKey,JSON.stringify({ts:Date.now(),scope:scopeKey,desk:[],error:err}));
+    return {scope:scopeKey,desk:[],error:err};
+  }
+}
+async function readDesk(env){const scopes={};let items=[];for(const sk of await getScopes(env)){const d=await env.TOKENS.get("desk:"+sk);if(d){const j=JSON.parse(d);scopes[sk]={updated:j.ts,count:j.desk.length,error:j.error||null};items=items.concat(j.desk);}else scopes[sk]={updated:null,count:0,error:null};}return {scopes,desk:items};}
 const TOOLS=[
   {name:"list_accounts",description:"List all mailboxes Fortmail owns (Gmail + IMAP).",inputSchema:{type:"object",properties:{}}},
   {name:"get_desk",description:"Return the current triaged desk across all mailboxes — only items that need a human.",inputSchema:{type:"object",properties:{}}},
   {name:"triage",description:"Run a live triage of one scope. scope='gmail' or an IMAP domain (e.g. 'example.com').",inputSchema:{type:"object",properties:{scope:{type:"string"}},required:["scope"]}},
-  {name:"read_box",description:"Read recent (90d) message headers from one mailbox (gmail or IMAP address). Each item includes a uid/id you can pass to read_message for the full body.",inputSchema:{type:"object",properties:{address:{type:"string"},count:{type:"number"}},required:["address"]}},
+  {name:"read_box",description:"Read message headers from one mailbox (gmail or IMAP address). Defaults to the last 90 days of the inbox. Each item includes a uid/id you can pass to read_message for the full body. GMAIL ONLY: pass `query` to run any Gmail search instead of the default — e.g. 'from:amazon after:2026/01/01 before:2026/06/01' — which is how you reach mail older than 90 days. Ignored for IMAP mailboxes.",inputSchema:{type:"object",properties:{address:{type:"string"},count:{type:"number"},query:{type:"string",description:"Gmail search syntax. Gmail mailboxes only. Overrides the default 'in:inbox newer_than:90d'."}},required:["address"]}},
   {name:"read_message",description:"Read the FULL body of one message plus attachment metadata (filename, mimeType, size, attachmentId). Bytes are NOT included — call get_attachment or GET /attachment. For IMAP pass uid; for Gmail pass the item's id.",inputSchema:{type:"object",properties:{address:{type:"string"},uid:{type:"string"}},required:["address","uid"]}},
   {name:"get_attachment",description:"Fetch one Gmail attachment's bytes (base64). Pass address, uid (Gmail message id from read_box/read_message), and filename (preferred) or attachmentId from read_message.attachments. Filename lookup avoids truncated Gmail attachmentIds. Payloads over 4MB are refused — use GET /attachment?address=&message=&filename= for raw bytes. Read-only; IMAP fetch is not supported.",inputSchema:{type:"object",properties:{address:{type:"string"},uid:{type:"string"},filename:{type:"string"},attachmentId:{type:"string"}},required:["address","uid"]}},
+  {name:"archive",description:"Archive Gmail messages (remove from INBOX, mark read; nothing is deleted). Pass ids (from read_box) or a Gmail search query — a query archives at most 100 matches. Gmail mailboxes only.",inputSchema:{type:"object",properties:{address:{type:"string"},ids:{type:"array",items:{type:"string"}},query:{type:"string",description:"Gmail search syntax, e.g. 'from:notifications@github.com \"Run failed\" newer_than:1d'"}},required:["address"]}},
   {name:"send",description:"Send an email AS any owned mailbox (Gmail or IMAP) — picks transport automatically.",inputSchema:{type:"object",properties:{from:{type:"string"},to:{type:"string"},subject:{type:"string"},text:{type:"string"}},required:["from","to","subject","text"]}},
   {name:"news_lists",description:"Newsletter: all lists with subscriber counts (total/confirmed).",inputSchema:{type:"object",properties:{}}},
   {name:"news_send",description:"Newsletter: queue a campaign to a list (drained in chunks by the cron), or set test to an email address to smoke-test to that one address only.",inputSchema:{type:"object",properties:{list:{type:"string"},subject:{type:"string"},text:{type:"string"},html:{type:"string"},test:{type:"string"}},required:["list","subject"]}},
   {name:"news_status",description:"Newsletter: recent campaigns and the pending queue; pass id for one campaign's full state.",inputSchema:{type:"object",properties:{id:{type:"string"}}}},
-  // Create/update a list. The HTTP route (/news/list) is gated on TRIGGER_KEY, so a list
-  // could only be born from a shell holding the key. This door is already admin —
-  // news_send can blast an entire list — so exposing create here is consistent, not an
-  // escalation. Same validation as the HTTP route, including the CAN-SPAM postal address.
+  // Create/update a list. The HTTP route (/news/list) is gated on TRIGGER_KEY, which
+  // meant a list could only be born from a shell with the key in hand — and the one
+  // Fort Card scoped to this host can't reach it (Cloudflare 1042, worker->worker on
+  // the same account, on public routes as well as gated ones). So the newsletter had
+  // an engine, a subscribe flow and a send rail, and no way to create the list any of
+  // them operate on. This door is already admin — news_send can blast an entire list —
+  // so exposing create here is consistent, not an escalation. Same validation as the
+  // HTTP route, including the CAN-SPAM postal address, which is required on every send.
   {name:"news_list_create",description:"Newsletter: create or update a list. slug is lowercase a-z 0-9 dashes. from is a full From header (e.g. \"The Fort <fort@example.com>\"). address is the physical mailing address REQUIRED by CAN-SPAM in every send. Re-running with an existing slug updates it and preserves its created date and subscribers.",inputSchema:{type:"object",properties:{slug:{type:"string"},name:{type:"string"},from:{type:"string"},reply_to:{type:"string"},address:{type:"string"}},required:["slug","name","from","address"]}}
 ];
 async function callTool(env,name,args){
@@ -388,7 +442,7 @@ async function callTool(env,name,args){
   if(name==="list_accounts")return {gmail:await listAccounts(env),imap:await listImap(env)};
   if(name==="get_desk")return await readDesk(env);
   if(name==="triage"){const sc=args.scope;if(sc==="gmail"){const out={};for(const e of await listAccounts(env))out[e]=await triageGmail(env,e).catch(x=>({error:String(x.message||x)}));return out;}const out={};for(const a of (await listImap(env)).filter(a=>a.endsWith("@"+sc)))out[a]=await triageBox(env,a).catch(x=>({error:String(x.message||x)}));return out;}
-  if(name==="read_box"){const a=args.address,n=args.count||10;if((await listAccounts(env)).includes(a))return {address:a,messages:await gmailRecent(env,a,n)};const c=await env.TOKENS.get("imap:"+a);if(!c)throw new Error("unknown mailbox "+a);const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);const {total,recent,items}=await imapHeaders(cc.host,cc.user,pass,n);return {address:a,total,recent,messages:items};}
+  if(name==="read_box"){const a=args.address,n=args.count||10;if((await listAccounts(env)).includes(a))return {address:a,query:args.query||QUERY,messages:await gmailRecent(env,a,n,args.query)};const c=await env.TOKENS.get("imap:"+a);if(!c)throw new Error("unknown mailbox "+a);const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);const {total,recent,items}=await imapHeaders(cc.host,cc.user,pass,n);return {address:a,total,recent,messages:items};}
   if(name==="read_message"){const a=args.address,uid=String(args.uid||"");if(!uid)throw new Error("uid required");if((await listAccounts(env)).includes(a))return {address:a,...await gmailMessageBody(env,a,uid)};const c=await env.TOKENS.get("imap:"+a);if(!c)throw new Error("unknown mailbox "+a);const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);return {address:a,...await imapReadMessage(cc.host,cc.user,pass,uid)};}
   if(name==="get_attachment"){
     const a=args.address,uid=String(args.uid||args.message||""),aid=String(args.attachmentId||""),fn=String(args.filename||"");
@@ -398,6 +452,7 @@ async function callTool(env,name,args){
     if(att.bytes.length>ATTACH_JSON_MAX)throw new Error("attachment too large for tool JSON ("+att.bytes.length+" bytes). GET /attachment?address="+encodeURIComponent(a)+"&message="+encodeURIComponent(uid)+"&filename="+encodeURIComponent(att.filename||fn||""));
     return {address:a,message:att.id,filename:att.filename,mimeType:att.mimeType,size:att.size,encoding:"base64",data:bytesToB64(att.bytes)};
   }
+  if(name==="archive"){const a=args.address;if(!(await listAccounts(env)).includes(a))throw new Error("archive is Gmail-only; unknown or IMAP mailbox "+a);return await gmailArchive(env,a,args.ids,args.query);}
   if(name==="send")return await sendMail(env,args.from,args.to,args.subject,args.text);
   if(name==="news_lists"){const out=[];for(const slug of await newsListsIdx(env)){const l=await newsGetList(env,slug);if(l)out.push({...l,subscribers:await newsCounts(env,slug)});}return {lists:out};}
   if(name==="news_list_create"){
@@ -405,6 +460,8 @@ async function callTool(env,name,args){
     if(!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug))throw new Error("slug: a-z 0-9 dashes, starting with a letter or digit");
     if(!args.name||!args.from)throw new Error('need name and from (e.g. "The Fort <fort@example.com>")');
     if(!args.address)throw new Error("need address — a physical mailing address is legally required in every send (CAN-SPAM)");
+    // Preserve `created` on re-run so updating a list never looks like a new one, and
+    // never touch news:sub:* — the subscribers are the list's, not this record's.
     const prev=await newsGetList(env,slug);
     const list={slug,name:args.name,from:args.from,reply_to:args.reply_to||"",address:args.address,created:(prev&&prev.created)||Date.now()};
     await newsPutList(env,list);
@@ -435,13 +492,106 @@ async function mcpHandle(env,req){
   if(m==="tools/call"){try{const out=await callTool(env,req.params.name,req.params.arguments);return {jsonrpc:"2.0",id,result:{content:[{type:"text",text:JSON.stringify(out,null,2)}]}};}catch(e){return {jsonrpc:"2.0",id,result:{isError:true,content:[{type:"text",text:String((e&&e.message)||e)}]}};}}
   return {jsonrpc:"2.0",id,error:{code:-32601,message:"method not found: "+m}};
 }
+// ── FORT MAIL, AS AN AGENT IN THE MESH ────────────────────────────────────────
+// Fort Mail already does the hard part: it triages 29 mailboxes into a desk of only
+// what needs a human (deterministic, no-LLM, on a 5-min cron). This entrypoint makes it
+// a first-class Fort agent — addressable by River over an in-account binding (the binding
+// IS the capability, no key), reporting its own state UP to the Steward.
+//
+// It also does the RETURN movement Fort Mail's plain triage doesn't: it watches ITSELF.
+// If a scope's cached desk goes stale, the triage cron has silently stopped for a whole
+// domain and mail is piling up unseen — the exact "an organ that can't report its own
+// state fails silently" failure (FORT_AGENT_LAW §4). River escalates that, not just the
+// mail. The lane judges; it does not relay (§0).
+//
+// Additive on purpose: the live cron, IMAP/Gmail transport, MCP, /desk, and newsletter
+// paths are untouched. If this class breaks, mail keeps flowing — only the reporting is
+// affected. That is how you make live infrastructure an agent without risking it.
+const MAIL_STALE_MS = 20 * 60 * 1000; // cron rotates every 5 min; 20 min = clearly stalled
+
+export class MailSteward extends WorkerEntrypoint {
+  // ── BOUND HANDS (2026-09-02) — the same four tools the MCP door offers, reachable by a
+  // bound Fort worker (the agent-rail) with NO key: the binding IS the capability. Added so
+  // the mail-steward and email-triage jobs could leave the Claude-hosted Routines. Each
+  // delegates to callTool, so there is exactly one implementation of reading and sending.
+  async accounts() { return await callTool(this.env, "list_accounts", {}); }
+  async readBox(address, count, query) { return await callTool(this.env, "read_box", { address, count: count || 10, query }); }
+  async readMessage(address, uid) { return await callTool(this.env, "read_message", { address, uid }); }
+  async getAttachment(address, uid, attachmentId, filename) { return await callTool(this.env, "get_attachment", { address, uid, attachmentId, filename }); }
+  async send(from, to, subject, text) { return await callTool(this.env, "send", { from, to, subject, text }); }
+
+  // Verified state, derived from the live desk. Never self-reported (§4).
+  async health() {
+    const { scopes, desk } = await readDesk(this.env);
+    const now = Date.now();
+    const stale = Object.entries(scopes)
+      .filter(([, v]) => !v.updated || now - v.updated > MAIL_STALE_MS)
+      .map(([k, v]) => ({ scope: k, updated: v.updated, error: v.error || null }));
+    return { deskCount: desk.length, scopes, stale, ok: stale.length === 0 };
+  }
+
+  // What in the mail lane needs Jimmy right now. The front (River) turns these into desk
+  // items; the lane never writes the desk directly (§0). Each carries a stable key so the
+  // front can dedup — the same email is never raised twice.
+  async needs() {
+    const { scopes, desk } = await readDesk(this.env);
+    const now = Date.now();
+    const out = [];
+    for (const it of desk) {
+      out.push({
+        key: "mail:" + it.box + ":" + (it.subject || ""),
+        what: "Email needs you — \"" + (it.subject || "(no subject)") + "\" from " + (it.from || "?"),
+        where: "Fort Mail · " + it.box,
+        whyHim: "triaged as needing a human reply or decision",
+      });
+    }
+    for (const [k, v] of Object.entries(scopes)) {
+      if (!v.updated || now - v.updated > MAIL_STALE_MS) {
+        out.push({
+          key: "mail-stale:" + k,
+          what: "Fort Mail stopped triaging " + k + (v.error ? " — " + v.error : ""),
+          where: "fort-mail worker · scope " + k,
+          whyHim: v.error
+            ? "the triage cron is hitting a real error on this scope: " + v.error
+            : "a whole domain's mail triage has gone silent — mail may be piling up unseen",
+        });
+      }
+    }
+    return out;
+  }
+}
+
+// THE REGISTRY LINE (doctrine fd7b0874). Once per isolate; a failure never
+// touches mail — a lost registration reappears as UNREGISTERED on the walk.
+let __registered=false;
+function __registerOnce(env,ctx){
+  if(__registered||!env.REGISTRY||!ctx)return;
+  __registered=true;
+  // try/catch: on a pre-RPC compat date this RPC call THROWS SYNCHRONOUSLY —
+  // measured on this exact worker 2026-08-03, where it killed cron ticks for
+  // ~2h behind a green deploy. A gate must not break the rail it guards.
+  try{
+  ctx.waitUntil(env.REGISTRY.register({
+    name:"mail",
+    worker:"fort-mail",
+    purpose:"Fort Mail - the sending organ: newsletters and notifications leave the Fort only through here, on Jimmy's tap.",
+    surface:["fetch"],
+    bindings:["REGISTRY"],
+    owner:"steward"
+  }).catch(()=>undefined));
+  }catch(_){/* stay visible as UNREGISTERED rather than down */}
+}
 export default {
-  async scheduled(event,env,ctx){ ctx.waitUntil((async()=>{try{await cronTick(env);}catch(e){}try{await stewardBridge(env,false);}catch(e){}try{await newsDrain(env);}catch(e){}})()); },
-  async fetch(request,env){
+  async scheduled(event,env,ctx){ __registerOnce(env,ctx); ctx.waitUntil((async()=>{try{await cronTick(env);}catch(e){}try{await stewardBridge(env,false);}catch(e){}try{await newsDrain(env);}catch(e){}})()); },
+  async fetch(request,env,ctx){
+    __registerOnce(env,ctx);
     const url=new URL(request.url);
     const path=url.pathname.replace(/\/+$/,"")||"/";
-    const okKey=env.TRIGGER_KEY&&url.searchParams.get("key")===env.TRIGGER_KEY;
-    const redirectUri=url.origin+"/oauth/callback";const origin=url.origin;
+    // Key gate accepts the query param (legacy) OR an Authorization: Bearer
+    // header — the header form is what the Fort Card wallet can inject, and it
+    // keeps the key out of URLs and access logs.
+    const okKey=env.TRIGGER_KEY&&(url.searchParams.get("key")===env.TRIGGER_KEY||(request.headers.get("authorization")||"").trim()==="Bearer "+env.TRIGGER_KEY);
+    const redirectUri="https://fort-mail.thefortthatholds.workers.dev/oauth/callback";const origin=url.origin;
     if(request.method==="OPTIONS")return new Response(null,{headers:{"access-control-allow-origin":"*","access-control-allow-methods":"GET,POST,OPTIONS","access-control-allow-headers":"authorization,content-type"}});
     if(path==="/") return html('<h2>Fortmail</h2><p>Agent-operated email. Your agent connects at <code>/mcp</code>.</p><p>Newsletter engine included — you own the list, the relay is a dumb pipe. See docs/NEWSLETTER.md.</p><p><a href="https://github.com/TheFortThatHolds/mail">Source &amp; setup</a></p>');
     if(path==="/.well-known/oauth-authorization-server"||path==="/.well-known/openid-configuration")
@@ -455,13 +605,12 @@ export default {
     if(path==="/authorize"){
       const q=url.searchParams;const cid=q.get("client_id"),rd=q.get("redirect_uri"),st=q.get("state")||"",cc=q.get("code_challenge")||"",ccm=q.get("code_challenge_method")||"plain";
       if(!cid||!rd) return html("<p>missing client_id/redirect_uri</p>");
-      if(request.method==="POST"){
-        const form=await request.formData();
-        if((form.get("key")||"")!==env.TRIGGER_KEY) return html('<h3>Fortmail — Connect</h3><p style="color:red">Wrong key.</p><form method="POST"><input name="key" type="password" placeholder="Fortmail key" autofocus/><button>Authorize</button></form>');
-        const code=tok(24);await env.TOKENS.put("oauthcode:"+code,JSON.stringify({cid,rd,cc,ccm}),{expirationTtl:600});
-        const sep=rd.includes("?")?"&":"?";return Response.redirect(rd+sep+"code="+code+"&state="+encodeURIComponent(st),302);
-      }
-      return html('<h3>Fortmail — Connect</h3><p>Authorize this client to operate your mail?</p><form method="POST"><input name="key" type="password" placeholder="Fortmail key" autofocus/> <button>Authorize</button></form>');
+      if(request.method!=="GET") return json({error:"method_not_allowed"},405);
+      if(!env.GMAIL_CLIENT_ID||!env.GMAIL_CLIENT_SECRET) return html("<p>FortMail owner sign-in is not configured.</p>");
+      const client=await env.TOKENS.get("oauthclient:"+cid,"json");
+      if(!client||!Array.isArray(client.redirect_uris)||!client.redirect_uris.includes(rd)) return json({error:"invalid_client",error_description:"redirect_uri was not registered"},400);
+      const nonce=tok(24);await env.TOKENS.put("mcpowner:"+nonce,JSON.stringify({cid,rd,st,cc,ccm}),{expirationTtl:600});
+      return Response.redirect(ownerSignInUrl(env,redirectUri,"fmcp:"+nonce),302);
     }
     if(path==="/token"&&request.method==="POST"){
       const form=await request.formData();const gt=form.get("grant_type");
@@ -485,6 +634,46 @@ export default {
     }
     if(path==="/bridge-run"){ if(!okKey) return new Response("unauthorized",{status:401}); const dry=url.searchParams.get("dry")==="1"; return json({ok:true,...await stewardBridge(env,dry)}); }
     if(path==="/desk"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({ok:true,...await readDesk(env)}); }
+    // Keyed door onto the SAME tool table the MCP serves — for a hand that holds a Fort Card
+    // but whose MCP schema predates a new verb (an MCP client freezes tools/list at connect;
+    // 2026-09-02 the archive verb shipped mid-session and was unreachable). Same gate as
+    // /send and /desk; body {name, args}.
+    if(path==="/tool"){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      let name="",args={};
+      if(request.method==="POST"){
+        const p=await request.json().catch(()=>({}));
+        name=p.name||p.tool||"";
+        if(p.arguments&&typeof p.arguments==="object")args=p.arguments;
+        else if(p.args&&typeof p.args==="object")args=p.args;
+        else{const rest={...p};delete rest.name;delete rest.tool;delete rest.arguments;delete rest.args;args=rest;}
+      }else{
+        name=url.searchParams.get("name")||url.searchParams.get("tool")||"";
+        for(const[k,v] of url.searchParams){if(k!=="key"&&k!=="name"&&k!=="tool")args[k]=v;}
+      }
+      if(!name) return json({ok:true,tools:TOOLS.map(t=>t.name)});
+      if(!TOOLS.some(t=>t.name===name)) return json({ok:false,error:"unknown tool "+name},400);
+      try{return json({ok:true,tool:name,result:await callTool(env,name,args)});}
+      catch(e){return json({ok:false,tool:name,error:String((e&&e.message)||e)},400);}
+    }
+    if(path==="/attachment"){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      const address=(url.searchParams.get("address")||"").trim();
+      const message=url.searchParams.get("message")||url.searchParams.get("uid")||"";
+      const attachmentId=url.searchParams.get("attachmentId")||"";
+      const filename=url.searchParams.get("filename")||"";
+      if(!address||!message||(!attachmentId&&!filename)) return json({ok:false,error:"need address, message, and attachmentId or filename"},400);
+      if(!(await listAccounts(env)).includes(address)) return json({ok:false,error:"unknown Gmail account (IMAP attachment fetch is not supported)"},400);
+      try{
+        const att=await gmailGetAttachment(env,address,message,attachmentId,filename);
+        const asJson=url.searchParams.get("encoding")==="base64"||url.searchParams.get("format")==="json";
+        if(asJson){
+          if(att.bytes.length>ATTACH_JSON_MAX) return json({ok:false,error:"attachment too large for JSON; omit encoding= to get raw bytes",size:att.bytes.length},413);
+          return json({ok:true,address,message:att.id,filename:att.filename,mimeType:att.mimeType,size:att.size,encoding:"base64",data:bytesToB64(att.bytes)});
+        }
+        return new Response(att.bytes,{headers:{"content-type":att.mimeType,"content-disposition":'attachment; filename="'+safeFilename(att.filename)+'"',"cache-control":"private, no-store","access-control-allow-origin":"*"}});
+      }catch(e){return json({ok:false,error:String((e&&e.message)||e)},400);}
+    }
     if(path==="/cron-run"){ if(!okKey) return new Response("unauthorized",{status:401}); const sc=url.searchParams.get("scope"); if(sc) return json({ok:true,scope:sc,desk:await runScope(env,sc)}); return json({ok:true,...await cronTick(env)}); }
     if(path==="/send"){ if(!okKey) return new Response("unauthorized",{status:401}); const q=url.searchParams;try{const out=await sendMail(env,q.get("from"),q.get("to"),q.get("subject")||"",q.get("text")||"");return json({ok:true,...out});}catch(e){return json({ok:false,error:String((e&&e.message)||e)});} }
     if(path==="/wallet-provision"){
@@ -509,41 +698,6 @@ export default {
     }
     if(path==="/imapboxes"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({boxes:await listImap(env)}); }
     if(path==="/accounts"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({gmail:await listAccounts(env),imap:await listImap(env)}); }
-    if(path==="/tool"){
-      if(!okKey) return new Response("unauthorized",{status:401});
-      let name="",args={};
-      if(request.method==="POST"){
-        const p=await request.json().catch(()=>({}));
-        name=p.name||p.tool||"";
-        if(p.arguments&&typeof p.arguments==="object")args=p.arguments;
-        else if(p.args&&typeof p.args==="object")args=p.args;
-        else{const rest={...p};delete rest.name;delete rest.tool;delete rest.arguments;delete rest.args;args=rest;}
-      }else{
-        name=url.searchParams.get("name")||url.searchParams.get("tool")||"";
-        for(const[k,v] of url.searchParams){if(k!=="key"&&k!=="name"&&k!=="tool")args[k]=v;}
-      }
-      if(!name) return json({ok:false,error:"need name"},400);
-      try{return json({ok:true,result:await callTool(env,name,args)});}
-      catch(e){return json({ok:false,error:String((e&&e.message)||e)},400);}
-    }
-    if(path==="/attachment"){
-      if(!okKey) return new Response("unauthorized",{status:401});
-      const address=(url.searchParams.get("address")||"").trim();
-      const message=url.searchParams.get("message")||url.searchParams.get("uid")||"";
-      const attachmentId=url.searchParams.get("attachmentId")||"";
-      const filename=url.searchParams.get("filename")||"";
-      if(!address||!message||(!attachmentId&&!filename)) return json({ok:false,error:"need address, message, and attachmentId or filename"},400);
-      if(!(await listAccounts(env)).includes(address)) return json({ok:false,error:"unknown Gmail account (IMAP attachment fetch is not supported)"},400);
-      try{
-        const att=await gmailGetAttachment(env,address,message,attachmentId,filename);
-        const asJson=url.searchParams.get("encoding")==="base64"||url.searchParams.get("format")==="json";
-        if(asJson){
-          if(att.bytes.length>ATTACH_JSON_MAX) return json({ok:false,error:"attachment too large for JSON; omit encoding= to get raw bytes",size:att.bytes.length},413);
-          return json({ok:true,address,message:att.id,filename:att.filename,mimeType:att.mimeType,size:att.size,encoding:"base64",data:bytesToB64(att.bytes)});
-        }
-        return new Response(att.bytes,{headers:{"content-type":att.mimeType,"content-disposition":'attachment; filename="'+safeFilename(att.filename)+'"',"cache-control":"private, no-store","access-control-allow-origin":"*"}});
-      }catch(e){return json({ok:false,error:String((e&&e.message)||e)},400);}
-    }
     if(path==="/triage"){
       if(!okKey) return new Response("unauthorized",{status:401});
       const scope=url.searchParams.get("scope")||"all";const domain=url.searchParams.get("domain")||"";const out={};const jobs=[];
@@ -664,6 +818,22 @@ export default {
       const rt=(request.headers.get("Authorization")||"").replace(/^Bearer\s+/i,"").trim();if(!rt) return json({ok:false,error:"no token in Authorization header"});
       try{const at=await refreshTok(env,rt);const prof=await gapi(at,"/users/me/profile");const email=prof.emailAddress||"unknown";await env.TOKENS.put("gmail:"+email,rt);await addAccount(env,email);return json({ok:true,connected:email});}catch(e){return json({ok:false,error:String((e&&e.message)||e)});}
     }
+    // Fort Card authenticates this call; the browser only receives an opaque,
+    // single-use 10-minute ticket, never TRIGGER_KEY.
+    if(path==="/connect-link"){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      const ticket=tok(24);await env.TOKENS.put("connectticket:"+ticket,"1",{expirationTtl:600});
+      return json({ok:true,url:url.origin+"/connect/go?t="+encodeURIComponent(ticket),expires_in:600});
+    }
+    if(path==="/connect/go"){
+      const ticket=url.searchParams.get("t")||"";const ticketKey="connectticket:"+ticket;
+      if(!ticket||!await env.TOKENS.get(ticketKey)) return html("<p>Invalid or expired reconnect link. Ask FortMail for a fresh one.</p>");
+      await env.TOKENS.delete(ticketKey);
+      const state=crypto.randomUUID().replace(/-/g,"");await env.TOKENS.put("state:"+state,"1",{expirationTtl:600});
+      const auth=new URL("https://accounts.google.com/o/oauth2/v2/auth");
+      auth.searchParams.set("client_id",env.GMAIL_CLIENT_ID);auth.searchParams.set("redirect_uri",redirectUri);auth.searchParams.set("response_type","code");auth.searchParams.set("scope",SCOPE);auth.searchParams.set("access_type","offline");auth.searchParams.set("prompt","consent");auth.searchParams.set("state",state);
+      return Response.redirect(auth.toString(),302);
+    }
     if(path==="/connect"){
       if(!okKey) return new Response("unauthorized",{status:401});
       const state=crypto.randomUUID().replace(/-/g,"");await env.TOKENS.put("state:"+state,"1",{expirationTtl:600});
@@ -673,6 +843,10 @@ export default {
     }
     if(path==="/oauth/callback"){
       const code=url.searchParams.get("code"),state=url.searchParams.get("state");if(!code||!state) return html('<p>Missing code/state.</p>');
+      if(state.startsWith("fmcp:")){
+        const nonce=state.slice(5),key="mcpowner:"+nonce;const raw=nonce&&await env.TOKENS.get(key);if(!raw) return html('<p>Invalid or expired FortMail connection. Start the connector again.</p>');await env.TOKENS.delete(key);
+        try{const pending=JSON.parse(raw);const t=await exchangeCode(env,code,redirectUri);const profile=await googleIdentity(t.access_token);if(!profile.email_verified||!isOwnerEmail(env,profile.email)) return new Response("This Google account is not an authorized FortMail owner.",{status:403});const oauthCode=tok(24);await env.TOKENS.put("oauthcode:"+oauthCode,JSON.stringify(pending),{expirationTtl:600});const back=new URL(pending.rd);back.searchParams.set("code",oauthCode);if(pending.st)back.searchParams.set("state",pending.st);return Response.redirect(back.toString(),302);}catch(e){return html('<p>FortMail sign-in failed: '+esc(String((e&&e.message)||e))+'</p>');}
+      }
       const s=await env.TOKENS.get("state:"+state);if(!s) return html('<p>Invalid or expired link. Start again at /connect.</p>');await env.TOKENS.delete("state:"+state);
       try{const t=await exchangeCode(env,code,redirectUri);if(!t.refresh_token) return html('<p>No refresh token. Remove the app at myaccount.google.com/permissions then reconnect.</p>');const prof=await gapi(t.access_token,"/users/me/profile");const email=prof.emailAddress||"unknown";await env.TOKENS.put("gmail:"+email,t.refresh_token);await addAccount(env,email);return html('<h2>Connected &#10003;</h2><p><b>'+email+'</b> is connected.</p>');}catch(e){return html('<p>Connect failed: '+String((e&&e.message)||e)+'</p>');}
     }

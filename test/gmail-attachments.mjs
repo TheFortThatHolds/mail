@@ -33,8 +33,9 @@ const fns = new Function(
     extract("gmailWalkPart"),
     extract("gmailWalkAttachments"),
     extract("gmailFindPart"),
+    extract("gmailFindPartByFilename"),
     extract("imapWalkAttachments"),
-    "return {gmailWalkPart,gmailWalkAttachments,gmailFindPart,imapWalkAttachments,b64urlToBytes,bytesToB64,safeFilename};",
+    "return {gmailWalkPart,gmailWalkAttachments,gmailFindPart,gmailFindPartByFilename,imapWalkAttachments,b64urlToBytes,bytesToB64,safeFilename};",
   ].join("\n")
 )();
 
@@ -77,10 +78,20 @@ assert.deepEqual(attachments[0], {
   mimeType: "application/pdf",
   size: 98765,
   attachmentId: "ANGjdJ-test-pdf",
+  idLen: "ANGjdJ-test-pdf".length,
+  hasInline: false,
 });
 assert.equal(attachments[1].filename, "photo.jpg");
 assert.equal(fns.gmailFindPart(pdfEmail, "ANGjdJ-test-pdf").filename, "LHM-service-record.pdf");
 assert.equal(fns.gmailFindPart(pdfEmail, "missing"), null);
+assert.equal(fns.gmailFindPartByFilename(pdfEmail, "LHM-service-record.pdf").body.attachmentId, "ANGjdJ-test-pdf");
+assert.equal(fns.gmailFindPartByFilename(pdfEmail, "nope.pdf"), null);
+const inlineOnly = {
+  filename: "inline-note.txt",
+  mimeType: "text/plain",
+  body: { data: b64url("hello-inline"), size: 12 },
+};
+assert.equal(fns.gmailFindPartByFilename(inlineOnly, "inline-note.txt").body.data, b64url("hello-inline"));
 
 const textOnly = { mimeType: "text/plain", filename: "", body: { data: b64url("just text") } };
 const none = [];
@@ -126,8 +137,9 @@ const round = fns.bytesToB64(fns.b64urlToBytes(b64url("hello-pdf")));
 assert.equal(Buffer.from(round, "base64").toString("utf8"), "hello-pdf");
 assert.equal(fns.safeFilename('bad\nname".pdf'), "bad_name_.pdf");
 
-for (const needle of ["/attachment", "get_attachment", "gmailWalkAttachments", "path===\"/tool\""]) {
+for (const needle of ["/attachment", "get_attachment", "gmailWalkAttachments", "gmailFindPartByFilename", "path===\"/tool\""]) {
   assert.ok(src.includes(needle), "worker.js should contain " + needle);
 }
+assert.ok(src.includes("filename") && src.includes("attachmentId or filename"), "GET /attachment should accept filename");
 
 console.log("ok — " + attachments.length + " gmail + " + imapAtt.length + " imap fixtures");

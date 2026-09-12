@@ -12,7 +12,7 @@ REST endpoints are the plumbing under it. This page is what to tell your agent.
 | `triage(scope)` | Live re-sweep of `gmail` or one domain — when freshness matters |
 | `read_box(address, count?)` | Recent headers (90d) for one box; items carry a `uid`/`id` |
 | `read_message(address, uid)` | Full plain-text body **plus** `attachments[]` metadata (no bytes) |
-| `get_attachment(address, uid, attachmentId)` | One Gmail attachment as base64 (≤4MB). Larger: `GET /attachment` |
+| `get_attachment(address, uid, filename \| attachmentId)` | One Gmail attachment as base64 (≤4MB). Prefer `filename` — Gmail `attachmentId`s get truncated on MCP/card hops. Larger: `GET /attachment` |
 | `send(from, to, subject, text)` | Send as any owned address; transport auto-picked |
 
 ### Attachments
@@ -21,15 +21,18 @@ REST endpoints are the plumbing under it. This page is what to tell your agent.
 `format=full` and returns each file part as:
 
 ```
-{ filename, mimeType, size, attachmentId }
+{ filename, mimeType, size, attachmentId, idLen, hasInline }
 ```
 
-plus the Gmail `id` of the message. Then fetch **one** file:
+plus the Gmail `id` of the message. Then fetch **one** file by **filename**
+(do not round-trip `attachmentId` — those IDs are often truncated at ~404 chars
+through MCP/Fort Card):
 
-- MCP / HTTP `/tool`: `get_attachment` → `{ filename, mimeType, size, encoding: "base64", data }`
-- HTTP (preferred for PDFs): `GET /attachment?key=$KEY&address=<gmail>&message=<id>&attachmentId=<id>`
+- MCP / HTTP `/tool`: `get_attachment` with `filename` → `{ filename, mimeType, size, encoding: "base64", data }`
+- HTTP (preferred for PDFs): `GET /attachment?key=$KEY&address=<gmail>&message=<id>&filename=<name>`
   returns the raw bytes with the part's `Content-Type` (e.g. `application/pdf`).
-  Add `encoding=base64` if your client needs JSON.
+  Add `encoding=base64` if your client needs JSON. `attachmentId` still works
+  when the full id actually arrives.
 
 IMAP `read_message` lists filenames when MIME headers have them;
 `attachmentId` is `null` and byte fetch is Gmail-only.

@@ -113,7 +113,7 @@ password is asked for, it's your `TRIGGER_KEY`.
 The agent gets: `list_accounts`, `get_desk`, `triage`, `read_box`,
 `read_message` (body + attachment metadata), `get_attachment` (Gmail
 bytes), `send`. HTTP equivalents: `GET /tool?key=&name=read_message&…`
-and `GET /attachment?key=&address=&message=&attachmentId=` (raw PDF).
+and `GET /attachment?key=&address=&message=&filename=` (raw PDF; `attachmentId` also accepted).
 See [AGENT.md](AGENT.md) § Attachments.
 
 ## 5. The steward bridge (optional — mail that wakes your agent)
