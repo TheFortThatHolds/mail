@@ -1,9 +1,9 @@
 export default {
   async fetch() {
     const PARTS = [
-      "https://raw.githubusercontent.com/TheFortThatHolds/mail/cursor/fort-mail-filename-attach/deploy/fort-mail.filename.gz.part0.b64",
-      "https://raw.githubusercontent.com/TheFortThatHolds/mail/cursor/fort-mail-filename-attach/deploy/fort-mail.filename.gz.part1.b64",
-      "https://raw.githubusercontent.com/TheFortThatHolds/mail/cursor/fort-mail-filename-attach/deploy/fort-mail.filename.gz.part2.b64"
+      "https://raw.githubusercontent.com/TheFortThatHolds/mail/cursor/gz-filename-parts-ee61/deploy/fort-mail.filename.gz.part0.b64",
+      "https://raw.githubusercontent.com/TheFortThatHolds/mail/cursor/gz-filename-parts-ee61/deploy/fort-mail.filename.gz.part1.b64",
+      "https://raw.githubusercontent.com/TheFortThatHolds/mail/cursor/gz-filename-parts-ee61/deploy/fort-mail.filename.gz.part2.b64"
     ];
     const PUT = "https://api.cloudflare.com/client/v4/accounts/eda7ec96bd3ba7a54851d552fcbd24e0/workers/scripts/fort-mail/content";
     const BROKER = "https://card.thefortthatholds.com/agent/use";
