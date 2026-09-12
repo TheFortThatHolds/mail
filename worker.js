@@ -14,6 +14,7 @@ import { connect } from "cloudflare:sockets";
 const SCOPE = "https://mail.google.com/";
 const QUERY = "in:inbox newer_than:90d";
 const DAYS=90;
+const ATTACH_JSON_MAX=4*1024*1024; // bound base64 tool/JSON payloads; raw /attachment is uncapped beyond Gmail's own limit
 const MON=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const BULK=/(unsubscribe|list-unsubscribe)/i;
 const OTP=/(verification code|security code|one[- ]?time (password|passcode|code)|\bOTP\b|is your .{0,20}code|login code|confirm your account|access code)/i;
@@ -86,6 +87,9 @@ async function imapMarkSeen(host,user,pass,uids){
 }
 function decodeQP(s){return s.replace(/=\r\n/g,"").replace(/=([0-9A-Fa-f]{2})/g,(_,h)=>String.fromCharCode(parseInt(h,16)));}
 function b64ToText(s){try{return decodeURIComponent(escape(atob(s.replace(/\s+/g,""))));}catch(e){return s;}}
+function b64urlToBytes(s){s=String(s||"").replace(/-/g,"+").replace(/_/g,"/");if(s.length%4)s+="====".slice(s.length%4);return ub64(s);}
+function bytesToB64(u){let s="";for(let i=0;i<u.length;i+=32768)s+=String.fromCharCode.apply(null,u.subarray(i,i+32768));return btoa(s);}
+function safeFilename(n){return String(n||"attachment").replace(/[\r\n"\\]/g,"_").replace(/[^\w.\- ()[\]]+/g,"_").slice(0,180)||"attachment";}
 function extractText(raw){
   const headEnd=raw.indexOf("\r\n\r\n");const head=headEnd>=0?raw.slice(0,headEnd):raw;const body=headEnd>=0?raw.slice(headEnd+4):"";
   const ct=(head.match(/^Content-Type:\s*([^\r\n]+(?:\r\n[ \t][^\r\n]+)*)/mi)||[])[1]||"";
@@ -105,6 +109,25 @@ function extractText(raw){
   const cte=(head.match(/Content-Transfer-Encoding:\s*([^\r\n]+)/i)||[])[1]||"";
   return (/base64/i.test(cte)?b64ToText(body):/quoted-printable/i.test(cte)?decodeQP(body):body).trim();
 }
+// List-only for IMAP: filenames from MIME. Byte fetch is Gmail-first (GET /attachment).
+function imapWalkAttachments(raw,out){
+  const headEnd=raw.indexOf("\r\n\r\n");if(headEnd<0)return;
+  const head=raw.slice(0,headEnd),body=raw.slice(headEnd+4);
+  const ct=(head.match(/^Content-Type:\s*([^\r\n]+(?:\r\n[ \t][^\r\n]+)*)/mi)||[])[1]||"";
+  const mime=(ct.match(/^([^\s;]+)/)||[])[1]||"";
+  const boundaryM=ct.match(/boundary="?([^";\r\n]+)"?/i);
+  if(boundaryM){
+    for(const part of body.split("--"+boundaryM[1])){
+      const p=part.replace(/^\r\n/,"").replace(/\r\n--$/,"").replace(/\r\n$/,"");
+      if(!p||p==="--"||p.startsWith("--"))continue;
+      imapWalkAttachments(p,out);
+    }
+    return;
+  }
+  const disp=(head.match(/^Content-Disposition:\s*([^\r\n]+(?:\r\n[ \t][^\r\n]+)*)/mi)||[])[1]||"";
+  const fn=((disp.match(/filename\*?=(?:UTF-8'')?"?([^";\r\n]+)"?/i)||ct.match(/name="?([^";\r\n]+)"?/i)||[])[1]||"").replace(/["']/g,"").trim();
+  if(fn||/^attachment/i.test(disp.trim())) out.push({filename:fn||"unnamed",mimeType:mime||"application/octet-stream",size:body.replace(/\r\n$/,"").length,attachmentId:null});
+}
 async function imapReadMessage(host,user,pass,uid){
   const o=await imapConn(host,user,pass);
   o.buf="";await o.send("a3 UID FETCH "+uid+" (UID BODY.PEEK[])\r\n");await o.wait("a3",10000);
@@ -112,7 +135,8 @@ async function imapReadMessage(host,user,pass,uid){
   const m=raw.match(/\* \d+ FETCH \(UID \d+ BODY\[\] \{\d+\}\r\n([\s\S]*)\)\r\n\S+ (OK|NO|BAD)/);
   const msg=m?m[1]:raw;
   const from=(msg.match(/^From:\s*(.*)$/mi)||[])[1]||"";const subject=(msg.match(/^Subject:\s*(.*)$/mi)||[])[1]||"";const date=(msg.match(/^Date:\s*(.*)$/mi)||[])[1]||"";
-  return {from:from.trim(),subject:subject.trim(),date:date.trim(),body:extractText(msg)};
+  const attachments=[];try{imapWalkAttachments(msg,attachments);}catch(e){}
+  return {uid,from:from.trim(),subject:subject.trim(),date:date.trim(),body:extractText(msg),attachments};
 }
 async function ghReq(env,method,path,body){
   if(!env.GITHUB_REPO)throw new Error("GITHUB_REPO not configured");
@@ -173,12 +197,41 @@ function gmailWalkPart(part){
   if(part.mimeType==="text/html"&&part.body&&part.body.data)return b64ToText(part.body.data.replace(/-/g,"+").replace(/_/g,"/")).replace(/<[^>]+>/g," ");
   return "";
 }
+// Gmail format=full already has filename / mimeType / body.attachmentId / size.
+// The old walk only returned text; this collects file parts without fetching bytes.
+function gmailWalkAttachments(part,out){
+  if(!part)return;
+  const fn=part.filename||"";
+  const aid=part.body&&part.body.attachmentId;
+  const mt=part.mimeType||"";
+  if(aid||(fn&&!/^multipart\//i.test(mt))){
+    out.push({filename:fn||"unnamed",mimeType:mt||"application/octet-stream",size:(part.body&&part.body.size)||0,attachmentId:aid||null});
+  }
+  if(part.parts)for(const p of part.parts)gmailWalkAttachments(p,out);
+}
+function gmailFindPart(part,aid){
+  if(!part||!aid)return null;
+  if(part.body&&part.body.attachmentId===aid)return part;
+  if(part.parts)for(const p of part.parts){const f=gmailFindPart(p,aid);if(f)return f;}
+  return null;
+}
 async function gmailMessageBody(env,email,id){
   const rt=await env.TOKENS.get("gmail:"+email);const at=await refreshTok(env,rt);
   const m=await gapi(at,"/users/me/messages/"+id+"?format=full");
   const h=(m.payload&&m.payload.headers)||[];const g=x=>{const y=h.find(z=>z.name.toLowerCase()===x);return y?y.value:"";};
   const body=gmailWalkPart(m.payload)||m.snippet||"";
-  return {from:g("from"),subject:g("subject"),date:g("date"),body:body.trim()};
+  const attachments=[];gmailWalkAttachments(m.payload,attachments);
+  return {id:m.id||id,from:g("from"),subject:g("subject"),date:g("date"),body:body.trim(),attachments};
+}
+async function gmailGetAttachment(env,email,messageId,attachmentId){
+  const rt=await env.TOKENS.get("gmail:"+email);if(!rt)throw new Error("unknown account "+email);
+  const at=await refreshTok(env,rt);
+  const m=await gapi(at,"/users/me/messages/"+encodeURIComponent(messageId)+"?format=full");
+  const part=gmailFindPart(m.payload,attachmentId);
+  if(!part)throw new Error("attachment not found on that message");
+  const att=await gapi(at,"/users/me/messages/"+encodeURIComponent(messageId)+"/attachments/"+encodeURIComponent(attachmentId));
+  const bytes=b64urlToBytes(att.data||"");
+  return {id:m.id||messageId,filename:part.filename||"unnamed",mimeType:part.mimeType||"application/octet-stream",size:att.size||bytes.length,bytes};
 }
 async function sendGmail(env,account,to,subject,text){
   const rt=await env.TOKENS.get("gmail:"+account);if(!rt)throw new Error("unknown account "+account);
@@ -303,7 +356,8 @@ const TOOLS=[
   {name:"get_desk",description:"Return the current triaged desk across all mailboxes — only items that need a human.",inputSchema:{type:"object",properties:{}}},
   {name:"triage",description:"Run a live triage of one scope. scope='gmail' or an IMAP domain (e.g. 'example.com').",inputSchema:{type:"object",properties:{scope:{type:"string"}},required:["scope"]}},
   {name:"read_box",description:"Read recent (90d) message headers from one mailbox (gmail or IMAP address). Each item includes a uid/id you can pass to read_message for the full body.",inputSchema:{type:"object",properties:{address:{type:"string"},count:{type:"number"}},required:["address"]}},
-  {name:"read_message",description:"Read the FULL body of one message. For an IMAP address pass the item's uid (from read_box/triage); for a Gmail address pass the item's id.",inputSchema:{type:"object",properties:{address:{type:"string"},uid:{type:"string"}},required:["address","uid"]}},
+  {name:"read_message",description:"Read the FULL body of one message plus attachment metadata (filename, mimeType, size, attachmentId). Bytes are NOT included — call get_attachment or GET /attachment. For IMAP pass uid; for Gmail pass the item's id.",inputSchema:{type:"object",properties:{address:{type:"string"},uid:{type:"string"}},required:["address","uid"]}},
+  {name:"get_attachment",description:"Fetch one Gmail attachment's bytes (base64). Pass address, uid (Gmail message id from read_box/read_message), and attachmentId from read_message.attachments. Payloads over 4MB are refused — use GET /attachment?address=&message=&attachmentId= for raw bytes. Read-only; IMAP fetch is not supported.",inputSchema:{type:"object",properties:{address:{type:"string"},uid:{type:"string"},attachmentId:{type:"string"}},required:["address","uid","attachmentId"]}},
   {name:"send",description:"Send an email AS any owned mailbox (Gmail or IMAP) — picks transport automatically.",inputSchema:{type:"object",properties:{from:{type:"string"},to:{type:"string"},subject:{type:"string"},text:{type:"string"}},required:["from","to","subject","text"]}},
   {name:"news_lists",description:"Newsletter: all lists with subscriber counts (total/confirmed).",inputSchema:{type:"object",properties:{}}},
   {name:"news_send",description:"Newsletter: queue a campaign to a list (drained in chunks by the cron), or set test to an email address to smoke-test to that one address only.",inputSchema:{type:"object",properties:{list:{type:"string"},subject:{type:"string"},text:{type:"string"},html:{type:"string"},test:{type:"string"}},required:["list","subject"]}},
@@ -321,6 +375,14 @@ async function callTool(env,name,args){
   if(name==="triage"){const sc=args.scope;if(sc==="gmail"){const out={};for(const e of await listAccounts(env))out[e]=await triageGmail(env,e).catch(x=>({error:String(x.message||x)}));return out;}const out={};for(const a of (await listImap(env)).filter(a=>a.endsWith("@"+sc)))out[a]=await triageBox(env,a).catch(x=>({error:String(x.message||x)}));return out;}
   if(name==="read_box"){const a=args.address,n=args.count||10;if((await listAccounts(env)).includes(a))return {address:a,messages:await gmailRecent(env,a,n)};const c=await env.TOKENS.get("imap:"+a);if(!c)throw new Error("unknown mailbox "+a);const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);const {total,recent,items}=await imapHeaders(cc.host,cc.user,pass,n);return {address:a,total,recent,messages:items};}
   if(name==="read_message"){const a=args.address,uid=String(args.uid||"");if(!uid)throw new Error("uid required");if((await listAccounts(env)).includes(a))return {address:a,...await gmailMessageBody(env,a,uid)};const c=await env.TOKENS.get("imap:"+a);if(!c)throw new Error("unknown mailbox "+a);const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);return {address:a,...await imapReadMessage(cc.host,cc.user,pass,uid)};}
+  if(name==="get_attachment"){
+    const a=args.address,uid=String(args.uid||args.message||""),aid=String(args.attachmentId||"");
+    if(!uid||!aid)throw new Error("uid and attachmentId required");
+    if(!(await listAccounts(env)).includes(a))throw new Error("get_attachment is Gmail-only — IMAP read_message lists filenames but does not fetch bytes");
+    const att=await gmailGetAttachment(env,a,uid,aid);
+    if(att.bytes.length>ATTACH_JSON_MAX)throw new Error("attachment too large for tool JSON ("+att.bytes.length+" bytes). GET /attachment?address="+encodeURIComponent(a)+"&message="+encodeURIComponent(uid)+"&attachmentId="+encodeURIComponent(aid));
+    return {address:a,message:att.id,filename:att.filename,mimeType:att.mimeType,size:att.size,encoding:"base64",data:bytesToB64(att.bytes)};
+  }
   if(name==="send")return await sendMail(env,args.from,args.to,args.subject,args.text);
   if(name==="news_lists"){const out=[];for(const slug of await newsListsIdx(env)){const l=await newsGetList(env,slug);if(l)out.push({...l,subscribers:await newsCounts(env,slug)});}return {lists:out};}
   if(name==="news_list_create"){
@@ -432,6 +494,40 @@ export default {
     }
     if(path==="/imapboxes"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({boxes:await listImap(env)}); }
     if(path==="/accounts"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({gmail:await listAccounts(env),imap:await listImap(env)}); }
+    if(path==="/tool"){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      let name="",args={};
+      if(request.method==="POST"){
+        const p=await request.json().catch(()=>({}));
+        name=p.name||p.tool||"";
+        if(p.arguments&&typeof p.arguments==="object")args=p.arguments;
+        else if(p.args&&typeof p.args==="object")args=p.args;
+        else{const rest={...p};delete rest.name;delete rest.tool;delete rest.arguments;delete rest.args;args=rest;}
+      }else{
+        name=url.searchParams.get("name")||url.searchParams.get("tool")||"";
+        for(const[k,v] of url.searchParams){if(k!=="key"&&k!=="name"&&k!=="tool")args[k]=v;}
+      }
+      if(!name) return json({ok:false,error:"need name"},400);
+      try{return json({ok:true,result:await callTool(env,name,args)});}
+      catch(e){return json({ok:false,error:String((e&&e.message)||e)},400);}
+    }
+    if(path==="/attachment"){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      const address=(url.searchParams.get("address")||"").trim();
+      const message=url.searchParams.get("message")||url.searchParams.get("uid")||"";
+      const attachmentId=url.searchParams.get("attachmentId")||"";
+      if(!address||!message||!attachmentId) return json({ok:false,error:"need address, message, attachmentId"},400);
+      if(!(await listAccounts(env)).includes(address)) return json({ok:false,error:"unknown Gmail account (IMAP attachment fetch is not supported)"},400);
+      try{
+        const att=await gmailGetAttachment(env,address,message,attachmentId);
+        const asJson=url.searchParams.get("encoding")==="base64"||url.searchParams.get("format")==="json";
+        if(asJson){
+          if(att.bytes.length>ATTACH_JSON_MAX) return json({ok:false,error:"attachment too large for JSON; omit encoding= to get raw bytes",size:att.bytes.length},413);
+          return json({ok:true,address,message:att.id,filename:att.filename,mimeType:att.mimeType,size:att.size,encoding:"base64",data:bytesToB64(att.bytes)});
+        }
+        return new Response(att.bytes,{headers:{"content-type":att.mimeType,"content-disposition":'attachment; filename="'+safeFilename(att.filename)+'"',"cache-control":"private, no-store","access-control-allow-origin":"*"}});
+      }catch(e){return json({ok:false,error:String((e&&e.message)||e)},400);}
+    }
     if(path==="/triage"){
       if(!okKey) return new Response("unauthorized",{status:401});
       const scope=url.searchParams.get("scope")||"all";const domain=url.searchParams.get("domain")||"";const out={};const jobs=[];

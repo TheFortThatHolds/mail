@@ -11,13 +11,35 @@ REST endpoints are the plumbing under it. This page is what to tell your agent.
 | `get_desk` | The triaged desk — ONLY items flagged as needing a human. Start here. |
 | `triage(scope)` | Live re-sweep of `gmail` or one domain — when freshness matters |
 | `read_box(address, count?)` | Recent headers (90d) for one box; items carry a `uid`/`id` |
-| `read_message(address, uid)` | Full plain-text body of one message |
+| `read_message(address, uid)` | Full plain-text body **plus** `attachments[]` metadata (no bytes) |
+| `get_attachment(address, uid, attachmentId)` | One Gmail attachment as base64 (≤4MB). Larger: `GET /attachment` |
 | `send(from, to, subject, text)` | Send as any owned address; transport auto-picked |
+
+### Attachments
+
+`read_message` never dumps file bytes. For a Gmail address it walks
+`format=full` and returns each file part as:
+
+```
+{ filename, mimeType, size, attachmentId }
+```
+
+plus the Gmail `id` of the message. Then fetch **one** file:
+
+- MCP / HTTP `/tool`: `get_attachment` → `{ filename, mimeType, size, encoding: "base64", data }`
+- HTTP (preferred for PDFs): `GET /attachment?key=$KEY&address=<gmail>&message=<id>&attachmentId=<id>`
+  returns the raw bytes with the part's `Content-Type` (e.g. `application/pdf`).
+  Add `encoding=base64` if your client needs JSON.
+
+IMAP `read_message` lists filenames when MIME headers have them;
+`attachmentId` is `null` and byte fetch is Gmail-only.
 
 ## A working loop for a mail-steward agent
 
 1. `get_desk` — the cron keeps it warm; this is cheap and instant.
-2. For anything on the desk: `read_message` for the full body before judging.
+2. For anything on the desk: `read_message` for the full body (and
+   `attachments[]`) before judging. If a PDF or other file matters, fetch
+   it with `get_attachment` or `GET /attachment` — it is not in `body`.
 3. Handle per your owner's rules: draft a reply, file a task, or surface it.
 4. `send` only what the owner has authorized (see the send discipline below).
 5. Something ambiguous? Leave it on the desk and ask — the desk is the
