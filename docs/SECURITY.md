@@ -7,7 +7,7 @@ threat model is bigger than "my own mail on my own Cloudflare account."
 
 | Surface | Gate |
 |---|---|
-| Admin REST endpoints (`/desk`, `/send`, `/wallet-*`, …) | `TRIGGER_KEY` (`?key=` query param) |
+| Admin REST endpoints (`/desk`, `/send`, `/tool`, `/attachment`, `/wallet-*`, …) | `TRIGGER_KEY` (`?key=` query param) |
 | `/mcp` | Its own OAuth: dynamic client registration, PKCE (S256), bearer tokens in KV (access 1h / refresh 90d). The authorize step asks for `TRIGGER_KEY`. |
 | Mailbox passwords | Sealed AES-GCM in KV; the seal key is worker-minted (`wallet_key` in KV) and never leaves the deployment. Nothing returns a stored password. (`/wallet-provision` returns a *newly minted* password exactly once, so you can set it at the provider.) |
 | Gmail | Refresh tokens in KV; your own OAuth app; scope is `https://mail.google.com/` (full mail — required for read+send via one grant). |

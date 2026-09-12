@@ -31,10 +31,12 @@ your domain(s) ─┤→  Fortmail worker  →  triage desk (only what matters)
 - **Speaks MCP.** `/mcp` is a Model Context Protocol server with its own
   OAuth (dynamic client registration + PKCE). MCP is vendor-neutral — connect
   any agent that takes an MCP server (Claude, ChatGPT, Gemini, Cursor, your
-  own harness) and it gets six tools: `list_accounts`, `get_desk`, `triage`,
-  `read_box`, `read_message`, `send`. There is **no LLM inside Fortmail
-  itself** — no model dependency, no API key to any AI vendor; the
-  intelligence is whatever agent you point at it.
+  own harness) and it gets the mail tools (`list_accounts`, `get_desk`,
+  `triage`, `read_box`, `read_message`, `get_attachment`, `send`) plus the
+  newsletter tools. `read_message` returns body text and attachment metadata;
+  `get_attachment` / `GET /attachment` fetch Gmail file bytes. There is
+  **no LLM inside Fortmail itself** — no model dependency, no API key to
+  any AI vendor; the intelligence is whatever agent you point at it.
 - **Sends as anyone you own.** Gmail via the API, everything else via SMTP —
   transport picked automatically from the `from` address.
 - **Runs your newsletters.** Subscriber lists live in *your* KV (not an
@@ -126,6 +128,8 @@ consequential, gate on your explicit approval, not on a From header.
 | `/wallet-provision?key=&addrs=&host=&smtp=` | Mint + seal new IMAP creds |
 | `/wallet-import?key=&addr=&host=&smtp=` | Seal an existing password (via `X-Mailbox-Password` header) |
 | `/accounts?key=` / `/imapboxes?key=` | List owned boxes |
+| `/tool?key=&name=` | Call any MCP tool over HTTP (`GET` query or `POST` JSON `{name,arguments}`) — same `TRIGGER_KEY` as `/accounts` |
+| `/attachment?key=&address=&message=&attachmentId=` | Fetch one Gmail attachment as raw bytes (`Content-Type` from the part). `encoding=base64` returns JSON instead. Read-only; 4MB cap on JSON/tool payloads |
 | `/connect?key=` → `/oauth/callback` | Gmail account OAuth flow |
 | `/import?key=` | Import an existing Gmail refresh token |
 | `/bridge-run?key=&dry=1` | Run/inspect the steward bridge now |
