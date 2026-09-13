@@ -257,8 +257,9 @@ async function smtpSend(host,user,pass,from,to,subject,text){
 // in ten minutes — and outward, irreversible acts do not pass. Two protections
 // sit here, and NEITHER is a confirmation dialog: a confirmation that a stray
 // keypress can answer is not consent. (Learned 2026-09-13, when a permission
-// prompt interrupted Jimmy mid-sentence and the keystroke already in flight
-// answered it. It can refuse what he wanted and authorize what he didn't.)
+// prompt interrupted the operator mid-sentence and the keystroke already in
+// flight answered it. It can refuse what they wanted and authorize what they
+// didn't.)
 //
 //   1. THE HOLD — outbound mail to a human outside the Fort is QUEUED, not
 //      sent. The cron drains it once the hold elapses. Anything still in the
@@ -267,18 +268,19 @@ async function smtpSend(host,user,pass,from,to,subject,text){
 //      up fifteen minutes later gets a vote.
 //   2. THE SIGNATURE — every agent-sent message says an agent sent it, names
 //      which agent, and names whose behalf. THE CALLER CANNOT SUPPRESS IT.
-//      An agent must never be able to pass as Jimmy typing.
+//      An agent must never be able to pass as the operator typing.
 //
 // AMBASSADOR SOCIAL STANDARDS: an agent writing to a human outside the Fort is
-// an ambassador, and the Fort is judged by what it sends. The standards below
-// are served at /ambassador and by the `ambassador` MCP tool, so every door —
-// Claude, GPT, Codex, Mistral, Nova — reads the SAME text rather than its own
-// memory of it. A standard an agent recalls is a standard that drifts.
-const AMBASSADOR = `AMBASSADOR SOCIAL STANDARDS — read before you send.
+// an ambassador, and the operator is judged by what it sends. The standards
+// below are served by the `ambassador` MCP tool (and /ambassador, key-gated),
+// so every door — Claude, GPT, Codex, whatever comes next — reads the SAME
+// text rather than its own memory of it. A standard an agent recalls is a
+// standard that drifts. Set OPERATOR_NAME and ORG_NAME to fill in the blanks.
+const ambassadorText=(env)=>`AMBASSADOR SOCIAL STANDARDS — read before you send.
 
 You are writing to a human being who did not ask to be corresponded with by a
-machine. You represent James Thornburg and The Fort That Holds. Everything you
-send is the Fort's reputation, permanently, in someone else's inbox.
+machine. You represent ${(env&&env.OPERATOR_NAME)||"your operator"}. Everything
+you send is their reputation, permanently, in someone else's inbox.
 
 1. SAY WHAT YOU ARE. Your signature does this automatically and you may not
    remove it. Never write a sentence that implies a human typed the message.
@@ -291,8 +293,8 @@ send is the Fort's reputation, permanently, in someone else's inbox.
 
 3. NEVER SEND IN ANGER, AND NEVER ON JIMMY'S ANGER EITHER. If the message
    would read as a resignation, an ultimatum, an accusation, or a burned
-   bridge, it does not go. That class of message is Jimmy's to send himself,
-   from his own hands, after sleeping on it. There is no exception.
+   bridge, it does not go. That class of message is the operator's to send
+   themselves, from their own hands, after sleeping on it. No exception.
 
 4. COURTESY IS NOT OPTIONAL AND IS NOT SUBMISSION. Plain, warm, brief. No
    grovelling, no throat-clearing, no performed deference — and no contempt
@@ -300,7 +302,8 @@ send is the Fort's reputation, permanently, in someone else's inbox.
    boring. Let the facts carry the weight.
 
 5. UNDERCLAIM. Never assert a fact you have not verified, never a date you
-   have not read, never a commitment on Jimmy's behalf that he has not made.
+   have not read, never a commitment on your operator's behalf they have not
+   made.
    "I don't know" and "let me check" are complete sentences and they cost
    nothing. An ambassador who is wrong once is not believed again.
 
@@ -309,19 +312,19 @@ send is the Fort's reputation, permanently, in someone else's inbox.
    Answer what was asked. Then stop.
 
 7. LEAVE THE DOOR OPEN. Every message ends somewhere a reply can land, and a
-   reply reaches Jimmy. You are a front door, not a wall.
+   reply reaches a human. You are a front door, not a wall.
 
 8. WHEN IT MATTERS, IT IS HIS. Anything that changes a relationship, spends
-   money, accepts terms, or cannot be taken back belongs to Jimmy. Draft it if
-   he asks. Do not send it.`;
+   money, accepts terms, or cannot be taken back belongs to your operator.
+   Draft it if they ask. Do not send it.`;
 
 // Lanes: identity + conduct + hold, per errand. Stored defaults here; an entry
 // in KV ("lane:<slug>") overrides, so a lane can be retuned without a deploy.
 const LANES = {
-  jimmy:    {who:"Jimmy's assistant",           on:"James Thornburg",              hold:15, note:"Personal correspondence. Highest care. He is a real person to these people, not a brand."},
-  business: {who:"an assistant at The Fort That Holds", on:"The Fort That Holds LLC", hold:15, note:"Operations: vendors, partners, platforms, readers."},
-  support:  {who:"an assistant at The Fort That Holds", on:"The Fort That Holds LLC", hold:5,  note:"Replying to inbound service and vendor mail. Lower stakes, same manners."},
-  legal:    {who:"Jimmy's assistant",           on:"James Thornburg",              hold:0,  blocked:true, note:"BLOCKED AT THE WORKER. Anything touching a claim, counsel, a court, an adjuster or an insurer is Jimmy's to transmit himself, from his own hands. Standing rule since August 2026. Draft it into the outbox if he asks; it will not send."},
+  personal: {who:"an assistant", on:"", hold:15, note:"Personal correspondence. Highest care — the operator is a real person to these people, not a brand."},
+  business: {who:"an assistant", on:"", hold:15, note:"Operations: vendors, partners, platforms, customers."},
+  support:  {who:"an assistant", on:"", hold:5,  note:"Replying to inbound service and vendor mail. Lower stakes, same manners."},
+  legal:    {who:"an assistant", on:"", hold:0,  blocked:true, note:"BLOCKED AT THE WORKER by default. Anything touching a claim, counsel, a court, or an insurer is the operator's to transmit themselves. Drop a lane:legal row in KV to change that; the default is to refuse."},
 };
 const LANE_DEFAULT = "business";
 async function getLane(env,slug){
@@ -333,11 +336,12 @@ async function getLane(env,slug){
 // The signature. Always appended, never suppressible. Says machine, says which
 // one, says on whose behalf — the three things a stranger needs to read the
 // message correctly.
-function signature(agent,lane){
-  const who=lane.who||"an assistant at The Fort That Holds";
+function signature(env,agent,lane){
+  const who=lane.who||"an assistant";
+  const on=lane.on||(env&&(env.OPERATOR_NAME||env.ORG_NAME))||"";
   const name=String(agent||"").trim();
   const self=name?(name[0].toUpperCase()+name.slice(1))+", "+who:who;
-  return "\n\n—\nSent by "+self+" — an AI agent acting for "+(lane.on||"The Fort That Holds LLC")+
+  return "\n\n—\nSent by "+self+" — an AI agent"+(on?" acting for "+on:"")+
          ".\nA reply to this message reaches a human.";
 }
 // Internal = a mailbox the Fort itself owns. No hold, no ambassador surface:
@@ -429,10 +433,10 @@ async function sendMail(env,from,to,subject,text,opts){
     if(arc.length<8)throw new Error("SHOW YOUR A.S.S. — Arc: '"+arc+"' is not an arc. Say what thread this belongs to in a real phrase.");
   }
   if(lane.blocked)
-    throw new Error("lane '"+lane.slug+"' is blocked at the worker and will not send. "+(lane.note||"")+" Draft it and hand it to Jimmy; he transmits it himself.");
+    throw new Error("lane '"+lane.slug+"' is blocked at the worker and will not send. "+(lane.note||"")+" Draft it and hand it to the operator.");
   // Fort-to-Fort: no stranger is being written to. Straight out, unsigned.
   if(await isInternal(env,to))return {via:"internal",...await sendNow(env,from,to,subject,text)};
-  const body=String(text||"")+signature(agent,lane);
+  const body=String(text||"")+signature(env,agent,lane);
   const holdMin=opts.hold!=null?Math.max(0,parseInt(opts.hold)):(lane.hold!=null?lane.hold:15);
   if(holdMin===0){await env.TOKENS.put("sent:"+tok(8),JSON.stringify({from,to,subject,ass:{arc,self:agent,lane:lane.slug},ts:Date.now()}),{expirationTtl:60*60*24*90});
     return {held:false,...await sendNow(env,from,to,subject,body)};}
@@ -546,8 +550,8 @@ const TOOLS=[
   {name:"read_box",description:"Read recent (90d) message headers from one mailbox (gmail or IMAP address). Each item includes a uid/id you can pass to read_message for the full body.",inputSchema:{type:"object",properties:{address:{type:"string"},count:{type:"number"}},required:["address"]}},
   {name:"read_message",description:"Read the FULL body of one message plus attachment metadata (filename, mimeType, size, attachmentId). Bytes are NOT included — call get_attachment or GET /attachment. For IMAP pass uid; for Gmail pass the item's id.",inputSchema:{type:"object",properties:{address:{type:"string"},uid:{type:"string"}},required:["address","uid"]}},
   {name:"get_attachment",description:"Fetch one Gmail attachment's bytes (base64). Pass address, uid (Gmail message id from read_box/read_message), and attachmentId from read_message.attachments. Payloads over 4MB are refused — use GET /attachment?address=&message=&attachmentId= for raw bytes. Read-only; IMAP fetch is not supported.",inputSchema:{type:"object",properties:{address:{type:"string"},uid:{type:"string"},attachmentId:{type:"string"}},required:["address","uid","attachmentId"]}},
-  {name:"send",description:"Send an email AS any owned mailbox (Gmail or IMAP) — picks transport automatically. ⚠ SHOW YOUR A.S.S.: mail to anyone outside the Fort requires `agent` (Self — which agent you are) and `arc` (one line on what thread this belongs to), and takes its manners and its hold from `lane`. Outward mail is SIGNED automatically, and you cannot suppress the signature. It is then HELD in the outbox for the lane's hold period rather than sent, so it can be killed — call `outbox` to see what is pending and `outbox_kill` to stop it. Lanes: jimmy (personal, 15m) · business (default, 15m) · support (inbound replies, 5m) · legal (BLOCKED — claims, counsel, courts, adjusters and insurers are Jimmy\'s to send himself). READ THE `ambassador` TOOL BEFORE YOUR FIRST SEND.",inputSchema:{type:"object",properties:{from:{type:"string"},to:{type:"string"},subject:{type:"string"},text:{type:"string"},agent:{type:"string",description:"SELF — which agent you are: river, nova, gpt, codex, mistral."},arc:{type:"string",description:"ARC — one line: what thread or errand does this send belong to? Stored with the message."},lane:{type:"string",description:"LANE — jimmy | business | support | legal. Default business."},hold:{type:"number",description:"Override the hold in minutes. You may lengthen it. Shortening it is for Jimmy, not for you."}},required:["from","to","subject","text"]}},
-  {name:"ambassador",description:"READ THIS BEFORE SENDING MAIL TO ANY HUMAN OUTSIDE THE FORT. The Ambassador Social Standards — how a Fort agent conducts itself when it speaks for Jimmy to the outside world — plus the lane table. Served from the worker so every door (Claude, GPT, Codex, Mistral, Nova) reads the same text instead of its own memory of it.",inputSchema:{type:"object",properties:{}}},
+  {name:"send",description:"Send an email AS any owned mailbox (Gmail or IMAP) — picks transport automatically. ⚠ SHOW YOUR A.S.S.: mail to anyone outside the Fort requires `agent` (Self — which agent you are) and `arc` (one line on what thread this belongs to), and takes its manners and its hold from `lane`. Outward mail is SIGNED automatically, and you cannot suppress the signature. It is then HELD in the outbox for the lane's hold period rather than sent, so it can be killed — call `outbox` to see what is pending and `outbox_kill` to stop it. Lanes: personal (15m) · business (default, 15m) · support (inbound replies, 5m) · legal (BLOCKED by default — claims, counsel, courts and insurers are the operator\'s to send themselves). READ THE `ambassador` TOOL BEFORE YOUR FIRST SEND.",inputSchema:{type:"object",properties:{from:{type:"string"},to:{type:"string"},subject:{type:"string"},text:{type:"string"},agent:{type:"string",description:"SELF — which agent you are (a short stable name, e.g. the assistant name your operator uses)."},arc:{type:"string",description:"ARC — one line: what thread or errand does this send belong to? Stored with the message."},lane:{type:"string",description:"LANE — personal | business | support | legal. Default business."},hold:{type:"number",description:"Override the hold in minutes. You may lengthen it. Shortening it is the operator's call, not yours."}},required:["from","to","subject","text"]}},
+  {name:"ambassador",description:"READ THIS BEFORE SENDING MAIL TO ANY HUMAN OUTSIDE THE FORT. The Ambassador Social Standards — how an agent conducts itself when it speaks for its operator to the outside world — plus the lane table. Served from the worker so every door reads the same text instead of its own memory of it.",inputSchema:{type:"object",properties:{}}},
   {name:"outbox",description:"What is sitting in the hold, not yet sent, and how many seconds until each one releases.",inputSchema:{type:"object",properties:{}}},
   {name:"outbox_kill",description:"Stop a held message before it sends. Pass an id, or 'all' to dump the whole outbox. This is the undo — it is meant to be usable in ten seconds.",inputSchema:{type:"object",properties:{id:{type:"string",description:"The outbox id, or 'all'."}},required:["id"]}},
   {name:"news_lists",description:"Newsletter: all lists with subscriber counts (total/confirmed).",inputSchema:{type:"object",properties:{}}},
@@ -575,7 +579,7 @@ async function callTool(env,name,args){
     return {address:a,message:att.id,filename:att.filename,mimeType:att.mimeType,size:att.size,encoding:"base64",data:bytesToB64(att.bytes)};
   }
   if(name==="send")return await sendMail(env,args.from,args.to,args.subject,args.text,{agent:args.agent,arc:args.arc,lane:args.lane,hold:args.hold});
-  if(name==="ambassador"){const lanes={};for(const k of Object.keys(LANES))lanes[k]=await getLane(env,k);return {standards:AMBASSADOR,lanes,hold:"Outward mail is queued, not sent. It leaves when the hold elapses and the cron next runs. Kill it with outbox_kill before then and it never happened.",signature:"Appended to every outward message. Not suppressible by the caller."};}
+  if(name==="ambassador"){const lanes={};for(const k of Object.keys(LANES))lanes[k]=await getLane(env,k);return {standards:ambassadorText(env),lanes,hold:"Outward mail is queued, not sent. It leaves when the hold elapses and the cron next runs. Kill it with outbox_kill before then and it never happened.",signature:"Appended to every outward message. Not suppressible by the caller."};}
   if(name==="outbox")return {pending:await outboxList(env)};
   if(name==="outbox_kill")return await outboxKill(env,String(args.id||""));
   if(name==="news_lists"){const out=[];for(const slug of await newsListsIdx(env)){const l=await newsGetList(env,slug);if(l)out.push({...l,subscribers:await newsCounts(env,slug)});}return {lists:out};}
@@ -666,10 +670,7 @@ export default {
     if(path==="/desk"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({ok:true,...await readDesk(env)}); }
     if(path==="/cron-run"){ if(!okKey) return new Response("unauthorized",{status:401}); const sc=url.searchParams.get("scope"); if(sc) return json({ok:true,scope:sc,desk:await runScope(env,sc)}); return json({ok:true,...await cronTick(env)}); }
     if(path==="/send"){ if(!okKey) return new Response("unauthorized",{status:401}); const q=url.searchParams;try{const out=await sendMail(env,q.get("from"),q.get("to"),q.get("subject")||"",q.get("text")||"",{agent:q.get("agent"),arc:q.get("arc"),lane:q.get("lane"),hold:q.get("hold")});return json({ok:true,...out});}catch(e){return json({ok:false,error:String((e&&e.message)||e)});} }
-    // The standards are public on purpose: anyone who receives mail from the
-    // Fort can read what the Fort holds itself to, and check it against what
-    // landed in their inbox.
-    if(path==="/ambassador"){ const lanes={};for(const k of Object.keys(LANES))lanes[k]=await getLane(env,k); return json({standards:AMBASSADOR,lanes}); }
+    if(path==="/ambassador"){ if(!okKey) return new Response("unauthorized",{status:401}); const lanes={};for(const k of Object.keys(LANES))lanes[k]=await getLane(env,k); return json({standards:ambassadorText(env),lanes}); }
     if(path==="/outbox"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({ok:true,pending:await outboxList(env)}); }
     // The kill switch. Deliberately a GET so it is one tap from a phone while
     // the feeling is still happening — ?id=<id> or ?id=all.

@@ -98,17 +98,18 @@ fifteen minutes later gets a vote. `outbox` shows what is pending, `outbox_kill`
 stops it (pass `all` to dump everything). Meant to be usable in ten seconds
 from a phone: `GET /outbox/kill?id=all&key=...`.
 
-**Lanes:** `jimmy` (personal, 15m) · `business` (default, 15m) · `support`
-(inbound replies, 5m) · `legal` — **blocked at the worker**. Anything touching a
-claim, counsel, a court, an adjuster or an insurer is the operator's to send
-himself, from his own hands. Override any lane without a deploy by writing
-`lane:<slug>` into KV.
+**Lanes:** `personal` (15m) · `business` (default, 15m) · `support` (inbound
+replies, 5m) · `legal` — **blocked at the worker by default**. Anything touching
+a claim, counsel, a court or an insurer is the operator's to send themselves.
+Retune or unblock any lane without a deploy by writing `lane:<slug>` into KV.
 
-**Read `GET /ambassador` (or the `ambassador` MCP tool) before your first
+**Read the `ambassador` MCP tool (or `GET /ambassador?key=…`) before your first
 send.** It serves the Ambassador Social Standards — how a Fort agent conducts
 itself when it speaks for a human to the outside world — from the worker, so
 every door reads the same text rather than its own memory of it. A standard an
-agent recalls is a standard that drifts. The short version: say what you are,
+agent recalls is a standard that drifts. Set `OPERATOR_NAME` (and optionally
+`ORG_NAME`) so the standards and the signature name who you act for. The short
+version: say what you are,
 never send on a mood, never send in anger, underclaim, disclose only the
 errand, and anything that cannot be taken back belongs to the human.
 
