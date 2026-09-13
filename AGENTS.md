@@ -119,4 +119,6 @@ landed in their inbox.
 ## Operating it after deploy
 
 Read `docs/AGENT.md` — tool list, a suggested working loop, and standing
-instructions worth adapting into your own system prompt.
+instructions worth adapting into your own system prompt. Attachments:
+list via `read_message`, fetch Gmail bytes via `get_attachment` or
+`GET /attachment` (do not expect PDFs inside the body text).

@@ -111,7 +111,10 @@ The OAuth dance is automatic (dynamic client registration + PKCE); when a
 password is asked for, it's your `TRIGGER_KEY`.
 
 The agent gets: `list_accounts`, `get_desk`, `triage`, `read_box`,
-`read_message`, `send`.
+`read_message` (body + attachment metadata), `get_attachment` (Gmail
+bytes), `send`. HTTP equivalents: `GET /tool?key=&name=read_message&…`
+and `GET /attachment?key=&address=&message=&attachmentId=` (raw PDF).
+See [AGENT.md](AGENT.md) § Attachments.
 
 ## 5. The steward bridge (optional — mail that wakes your agent)
 
