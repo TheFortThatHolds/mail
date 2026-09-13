@@ -251,12 +251,200 @@ async function smtpSend(host,user,pass,from,to,subject,text){
   const msg="From: "+from+"\r\nTo: "+to+"\r\nSubject: "+subject+"\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\n\r\n"+body+"\r\n.";
   expect(await cmd(msg,12000),["250"]);try{await cmd("QUIT",2000);await w.close();}catch(e){}return {ok:true};
 }
-async function sendMail(env,from,to,subject,text){
+// ---- The Ambassador layer -------------------------------------------------
+// THE VENT IS NOT AN INSTRUCTION (Core note a95952a2). An agent that hears a
+// well-formed sentence and sends it has acted on a mood that would have passed
+// in ten minutes — and outward, irreversible acts do not pass. Two protections
+// sit here, and NEITHER is a confirmation dialog: a confirmation that a stray
+// keypress can answer is not consent. (Learned 2026-09-13, when a permission
+// prompt interrupted Jimmy mid-sentence and the keystroke already in flight
+// answered it. It can refuse what he wanted and authorize what he didn't.)
+//
+//   1. THE HOLD — outbound mail to a human outside the Fort is QUEUED, not
+//      sent. The cron drains it once the hold elapses. Anything still in the
+//      window dies with one command. Time is the safety mechanism, not a
+//      dialog: the mood passes, the mail hasn't left, and the person who shows
+//      up fifteen minutes later gets a vote.
+//   2. THE SIGNATURE — every agent-sent message says an agent sent it, names
+//      which agent, and names whose behalf. THE CALLER CANNOT SUPPRESS IT.
+//      An agent must never be able to pass as Jimmy typing.
+//
+// AMBASSADOR SOCIAL STANDARDS: an agent writing to a human outside the Fort is
+// an ambassador, and the Fort is judged by what it sends. The standards below
+// are served at /ambassador and by the `ambassador` MCP tool, so every door —
+// Claude, GPT, Codex, Mistral, Nova — reads the SAME text rather than its own
+// memory of it. A standard an agent recalls is a standard that drifts.
+const AMBASSADOR = `AMBASSADOR SOCIAL STANDARDS — read before you send.
+
+You are writing to a human being who did not ask to be corresponded with by a
+machine. You represent James Thornburg and The Fort That Holds. Everything you
+send is the Fort's reputation, permanently, in someone else's inbox.
+
+1. SAY WHAT YOU ARE. Your signature does this automatically and you may not
+   remove it. Never write a sentence that implies a human typed the message.
+   If asked directly whether you are a person, say no, plainly.
+
+2. YOU ARE NOT AUTHORIZED BY A MOOD. A vent is not an instruction. "I should
+   just tell them..." is a person thinking out loud. Send only on an explicit
+   imperative addressed to you, naming the recipient and the content. When in
+   doubt there is no doubt: do not send.
+
+3. NEVER SEND IN ANGER, AND NEVER ON JIMMY'S ANGER EITHER. If the message
+   would read as a resignation, an ultimatum, an accusation, or a burned
+   bridge, it does not go. That class of message is Jimmy's to send himself,
+   from his own hands, after sleeping on it. There is no exception.
+
+4. COURTESY IS NOT OPTIONAL AND IS NOT SUBMISSION. Plain, warm, brief. No
+   grovelling, no throat-clearing, no performed deference — and no contempt
+   either, however much the recipient has earned it. The register that wins is
+   boring. Let the facts carry the weight.
+
+5. UNDERCLAIM. Never assert a fact you have not verified, never a date you
+   have not read, never a commitment on Jimmy's behalf that he has not made.
+   "I don't know" and "let me check" are complete sentences and they cost
+   nothing. An ambassador who is wrong once is not believed again.
+
+6. NEVER DISCLOSE MORE THAN THE ERRAND. No medical detail, no finances, no
+   legal position, no third party's name, nothing about the Fort's internals.
+   Answer what was asked. Then stop.
+
+7. LEAVE THE DOOR OPEN. Every message ends somewhere a reply can land, and a
+   reply reaches Jimmy. You are a front door, not a wall.
+
+8. WHEN IT MATTERS, IT IS HIS. Anything that changes a relationship, spends
+   money, accepts terms, or cannot be taken back belongs to Jimmy. Draft it if
+   he asks. Do not send it.`;
+
+// Lanes: identity + conduct + hold, per errand. Stored defaults here; an entry
+// in KV ("lane:<slug>") overrides, so a lane can be retuned without a deploy.
+const LANES = {
+  jimmy:    {who:"Jimmy's assistant",           on:"James Thornburg",              hold:15, note:"Personal correspondence. Highest care. He is a real person to these people, not a brand."},
+  business: {who:"an assistant at The Fort That Holds", on:"The Fort That Holds LLC", hold:15, note:"Operations: vendors, partners, platforms, readers."},
+  support:  {who:"an assistant at The Fort That Holds", on:"The Fort That Holds LLC", hold:5,  note:"Replying to inbound service and vendor mail. Lower stakes, same manners."},
+  legal:    {who:"Jimmy's assistant",           on:"James Thornburg",              hold:0,  blocked:true, note:"BLOCKED AT THE WORKER. Anything touching a claim, counsel, a court, an adjuster or an insurer is Jimmy's to transmit himself, from his own hands. Standing rule since August 2026. Draft it into the outbox if he asks; it will not send."},
+};
+const LANE_DEFAULT = "business";
+async function getLane(env,slug){
+  const s=String(slug||LANE_DEFAULT).toLowerCase();
+  const kv=await env.TOKENS.get("lane:"+s);
+  if(kv){try{return {slug:s,...LANES[s],...JSON.parse(kv)};}catch(e){}}
+  return LANES[s]?{slug:s,...LANES[s]}:{slug:s,...LANES[LANE_DEFAULT],unknown:true};
+}
+// The signature. Always appended, never suppressible. Says machine, says which
+// one, says on whose behalf — the three things a stranger needs to read the
+// message correctly.
+function signature(agent,lane){
+  const who=lane.who||"an assistant at The Fort That Holds";
+  const name=String(agent||"").trim();
+  const self=name?(name[0].toUpperCase()+name.slice(1))+", "+who:who;
+  return "\n\n—\nSent by "+self+" — an AI agent acting for "+(lane.on||"The Fort That Holds LLC")+
+         ".\nA reply to this message reaches a human.";
+}
+// Internal = a mailbox the Fort itself owns. No hold, no ambassador surface:
+// nobody outside is being written to.
+async function isInternal(env,addr){
+  const a=String(addr||"").toLowerCase().trim();
+  if(!a)return false;
+  if((await listAccounts(env)).map(x=>x.toLowerCase()).includes(a))return true;
+  if((await listImap(env)).map(x=>x.toLowerCase()).includes(a))return true;
+  const extra=(env.INTERNAL_DOMAINS||"").split(",").map(s=>s.trim().toLowerCase()).filter(Boolean);
+  return extra.some(d=>a.endsWith("@"+d));
+}
+// ---- The outbox -----------------------------------------------------------
+async function outboxIdx(env){const a=await env.TOKENS.get("outbox");return a?JSON.parse(a):[];}
+async function outboxPut(env,item){
+  await env.TOKENS.put("out:"+item.id,JSON.stringify(item));
+  const q=await outboxIdx(env);if(!q.includes(item.id)){q.push(item.id);await env.TOKENS.put("outbox",JSON.stringify(q));}
+}
+async function outboxGet(env,id){const r=await env.TOKENS.get("out:"+id);return r?JSON.parse(r):null;}
+async function outboxList(env){
+  const out=[];for(const id of await outboxIdx(env)){const i=await outboxGet(env,id);if(i)out.push(i);}
+  const now=Date.now();
+  return out.map(i=>({...i,releases_in_sec:Math.max(0,Math.round((i.due-now)/1000))}));
+}
+// One command kills it. This is the whole point of the hold — it has to be
+// usable in ten seconds, from a phone, while the feeling is still happening.
+async function outboxKill(env,id){
+  const q=await outboxIdx(env);
+  if(id==="all"||id===true){
+    const killed=[];
+    for(const k of q){const i=await outboxGet(env,k);if(i){i.status="killed";i.killed=Date.now();await env.TOKENS.put("out:"+k,JSON.stringify(i));killed.push({id:k,to:i.to,subject:i.subject});}}
+    await env.TOKENS.put("outbox",JSON.stringify([]));
+    return {killed:killed.length,messages:killed};
+  }
+  const i=await outboxGet(env,id);if(!i)throw new Error("nothing queued as "+id);
+  i.status="killed";i.killed=Date.now();await env.TOKENS.put("out:"+id,JSON.stringify(i));
+  await env.TOKENS.put("outbox",JSON.stringify(q.filter(x=>x!==id)));
+  return {killed:1,messages:[{id,to:i.to,subject:i.subject}]};
+}
+// Drained by the same cron that runs triage and the newsletter. Only mail whose
+// hold has fully elapsed goes; everything else waits for the next tick.
+async function outboxDrain(env){
+  const q=await outboxIdx(env);if(!q.length)return {idle:true};
+  const now=Date.now();const keep=[];const sent=[];
+  for(const id of q){
+    const i=await outboxGet(env,id);
+    if(!i||i.status==="killed")continue;
+    if(i.due>now){keep.push(id);continue;}
+    try{
+      const r=await sendNow(env,i.from,i.to,i.subject,i.body);
+      i.status="sent";i.sent=Date.now();i.result=r;sent.push({id,to:i.to,subject:i.subject});
+    }catch(e){
+      i.tries=(i.tries||0)+1;i.lastError=String((e&&e.message)||e).slice(0,300);
+      if(i.tries<4){i.due=now+5*60*1000;keep.push(id);}else i.status="failed";
+    }
+    await env.TOKENS.put("out:"+id,JSON.stringify(i));
+  }
+  await env.TOKENS.put("outbox",JSON.stringify(keep));
+  return {sent:sent.length,pending:keep.length,messages:sent};
+}
+
+// The transport. Nothing calls this directly except the outbox drain and an
+// internal (Fort-to-Fort) send — everything outward goes through sendMail().
+async function sendNow(env,from,to,subject,text){
   if((await listAccounts(env)).includes(from))return {via:"gmail",id:await sendGmail(env,from,to,subject,text)};
   const c=await env.TOKENS.get("imap:"+from);if(!c)throw new Error("unknown sender "+from);
   const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);const smtpHost=cc.smtp||(cc.host||"").replace(/^imap\./,"smtp.");
   if(!smtpHost)throw new Error("no smtp host for "+from);
   await smtpSend(smtpHost,cc.user,pass,from,to,subject,text);return {via:"smtp",ok:true};
+}
+// THE GATE. Every send path in this worker funnels through here — the `send`
+// MCP tool, the /send route, anything an agent reaches for. It signs, it holds,
+// and for the legal lane it refuses outright.
+async function sendMail(env,from,to,subject,text,opts){
+  opts=opts||{};
+  const lane=await getLane(env,opts.lane);
+  const agent=String(opts.agent||"").trim();
+  const arc=String(opts.arc||"").trim();
+  // SHOW YOUR A.S.S. — Arc / Self / Lane, the Core's boundary handshake. Mail
+  // to a stranger IS the boundary, so the handshake is enforced here rather
+  // than remembered. Self = which agent. Lane = which errand, and the conduct
+  // that goes with it. Arc = what you are standing inside, in your own words;
+  // it is stored with the message, so every send carries a record of what the
+  // agent believed it was doing. An agent that cannot say why it is writing to
+  // a human has no business writing to one.
+  if(!(await isInternal(env,to))){
+    if(!agent)throw new Error("SHOW YOUR A.S.S. — Self: pass agent (e.g. 'river','nova','gpt'). Outward mail is signed by a named agent, never anonymously. GET /ambassador.");
+    if(!arc)throw new Error("SHOW YOUR A.S.S. — Arc: pass arc, one line on what thread this send belongs to (e.g. 'ICA comp claim scheduling', 'Writing Voices vendor invoice'). It is stored with the message. GET /ambassador.");
+    if(arc.length<8)throw new Error("SHOW YOUR A.S.S. — Arc: '"+arc+"' is not an arc. Say what thread this belongs to in a real phrase.");
+  }
+  if(lane.blocked)
+    throw new Error("lane '"+lane.slug+"' is blocked at the worker and will not send. "+(lane.note||"")+" Draft it and hand it to Jimmy; he transmits it himself.");
+  // Fort-to-Fort: no stranger is being written to. Straight out, unsigned.
+  if(await isInternal(env,to))return {via:"internal",...await sendNow(env,from,to,subject,text)};
+  const body=String(text||"")+signature(agent,lane);
+  const holdMin=opts.hold!=null?Math.max(0,parseInt(opts.hold)):(lane.hold!=null?lane.hold:15);
+  if(holdMin===0){await env.TOKENS.put("sent:"+tok(8),JSON.stringify({from,to,subject,ass:{arc,self:agent,lane:lane.slug},ts:Date.now()}),{expirationTtl:60*60*24*90});
+    return {held:false,...await sendNow(env,from,to,subject,body)};}
+  const id=tok(8);
+  const item={id,from,to,subject:subject||"",body,
+              ass:{arc,self:agent,lane:lane.slug},
+              agent,lane:lane.slug,
+              queued:Date.now(),due:Date.now()+holdMin*60*1000,status:"held",tries:0};
+  await outboxPut(env,item);
+  return {held:true,id,releases_in_minutes:holdMin,to,subject:item.subject,
+          kill:"outbox_kill id="+id+"  (or 'all')",
+          note:"Not sent. Sitting in the outbox for "+holdMin+" minutes. Kill it with the command above and it never happened."};
 }
 // ---- Newsletter engine ----------------------------------------------------
 // You own the list; the relay is a dumb pipe. Subscribers live in YOUR KV as
@@ -358,7 +546,10 @@ const TOOLS=[
   {name:"read_box",description:"Read recent (90d) message headers from one mailbox (gmail or IMAP address). Each item includes a uid/id you can pass to read_message for the full body.",inputSchema:{type:"object",properties:{address:{type:"string"},count:{type:"number"}},required:["address"]}},
   {name:"read_message",description:"Read the FULL body of one message plus attachment metadata (filename, mimeType, size, attachmentId). Bytes are NOT included — call get_attachment or GET /attachment. For IMAP pass uid; for Gmail pass the item's id.",inputSchema:{type:"object",properties:{address:{type:"string"},uid:{type:"string"}},required:["address","uid"]}},
   {name:"get_attachment",description:"Fetch one Gmail attachment's bytes (base64). Pass address, uid (Gmail message id from read_box/read_message), and attachmentId from read_message.attachments. Payloads over 4MB are refused — use GET /attachment?address=&message=&attachmentId= for raw bytes. Read-only; IMAP fetch is not supported.",inputSchema:{type:"object",properties:{address:{type:"string"},uid:{type:"string"},attachmentId:{type:"string"}},required:["address","uid","attachmentId"]}},
-  {name:"send",description:"Send an email AS any owned mailbox (Gmail or IMAP) — picks transport automatically.",inputSchema:{type:"object",properties:{from:{type:"string"},to:{type:"string"},subject:{type:"string"},text:{type:"string"}},required:["from","to","subject","text"]}},
+  {name:"send",description:"Send an email AS any owned mailbox (Gmail or IMAP) — picks transport automatically. ⚠ SHOW YOUR A.S.S.: mail to anyone outside the Fort requires `agent` (Self — which agent you are) and `arc` (one line on what thread this belongs to), and takes its manners and its hold from `lane`. Outward mail is SIGNED automatically, and you cannot suppress the signature. It is then HELD in the outbox for the lane's hold period rather than sent, so it can be killed — call `outbox` to see what is pending and `outbox_kill` to stop it. Lanes: jimmy (personal, 15m) · business (default, 15m) · support (inbound replies, 5m) · legal (BLOCKED — claims, counsel, courts, adjusters and insurers are Jimmy\'s to send himself). READ THE `ambassador` TOOL BEFORE YOUR FIRST SEND.",inputSchema:{type:"object",properties:{from:{type:"string"},to:{type:"string"},subject:{type:"string"},text:{type:"string"},agent:{type:"string",description:"SELF — which agent you are: river, nova, gpt, codex, mistral."},arc:{type:"string",description:"ARC — one line: what thread or errand does this send belong to? Stored with the message."},lane:{type:"string",description:"LANE — jimmy | business | support | legal. Default business."},hold:{type:"number",description:"Override the hold in minutes. You may lengthen it. Shortening it is for Jimmy, not for you."}},required:["from","to","subject","text"]}},
+  {name:"ambassador",description:"READ THIS BEFORE SENDING MAIL TO ANY HUMAN OUTSIDE THE FORT. The Ambassador Social Standards — how a Fort agent conducts itself when it speaks for Jimmy to the outside world — plus the lane table. Served from the worker so every door (Claude, GPT, Codex, Mistral, Nova) reads the same text instead of its own memory of it.",inputSchema:{type:"object",properties:{}}},
+  {name:"outbox",description:"What is sitting in the hold, not yet sent, and how many seconds until each one releases.",inputSchema:{type:"object",properties:{}}},
+  {name:"outbox_kill",description:"Stop a held message before it sends. Pass an id, or 'all' to dump the whole outbox. This is the undo — it is meant to be usable in ten seconds.",inputSchema:{type:"object",properties:{id:{type:"string",description:"The outbox id, or 'all'."}},required:["id"]}},
   {name:"news_lists",description:"Newsletter: all lists with subscriber counts (total/confirmed).",inputSchema:{type:"object",properties:{}}},
   {name:"news_send",description:"Newsletter: queue a campaign to a list (drained in chunks by the cron), or set test to an email address to smoke-test to that one address only.",inputSchema:{type:"object",properties:{list:{type:"string"},subject:{type:"string"},text:{type:"string"},html:{type:"string"},test:{type:"string"}},required:["list","subject"]}},
   {name:"news_status",description:"Newsletter: recent campaigns and the pending queue; pass id for one campaign's full state.",inputSchema:{type:"object",properties:{id:{type:"string"}}}},
@@ -383,7 +574,10 @@ async function callTool(env,name,args){
     if(att.bytes.length>ATTACH_JSON_MAX)throw new Error("attachment too large for tool JSON ("+att.bytes.length+" bytes). GET /attachment?address="+encodeURIComponent(a)+"&message="+encodeURIComponent(uid)+"&attachmentId="+encodeURIComponent(aid));
     return {address:a,message:att.id,filename:att.filename,mimeType:att.mimeType,size:att.size,encoding:"base64",data:bytesToB64(att.bytes)};
   }
-  if(name==="send")return await sendMail(env,args.from,args.to,args.subject,args.text);
+  if(name==="send")return await sendMail(env,args.from,args.to,args.subject,args.text,{agent:args.agent,arc:args.arc,lane:args.lane,hold:args.hold});
+  if(name==="ambassador"){const lanes={};for(const k of Object.keys(LANES))lanes[k]=await getLane(env,k);return {standards:AMBASSADOR,lanes,hold:"Outward mail is queued, not sent. It leaves when the hold elapses and the cron next runs. Kill it with outbox_kill before then and it never happened.",signature:"Appended to every outward message. Not suppressible by the caller."};}
+  if(name==="outbox")return {pending:await outboxList(env)};
+  if(name==="outbox_kill")return await outboxKill(env,String(args.id||""));
   if(name==="news_lists"){const out=[];for(const slug of await newsListsIdx(env)){const l=await newsGetList(env,slug);if(l)out.push({...l,subscribers:await newsCounts(env,slug)});}return {lists:out};}
   if(name==="news_list_create"){
     const slug=String(args.slug||"").trim().toLowerCase();
@@ -421,7 +615,7 @@ async function mcpHandle(env,req){
   return {jsonrpc:"2.0",id,error:{code:-32601,message:"method not found: "+m}};
 }
 export default {
-  async scheduled(event,env,ctx){ ctx.waitUntil((async()=>{try{await cronTick(env);}catch(e){}try{await stewardBridge(env,false);}catch(e){}try{await newsDrain(env);}catch(e){}})()); },
+  async scheduled(event,env,ctx){ ctx.waitUntil((async()=>{try{await cronTick(env);}catch(e){}try{await stewardBridge(env,false);}catch(e){}try{await newsDrain(env);}catch(e){}try{await outboxDrain(env);}catch(e){}})()); },
   async fetch(request,env){
     const url=new URL(request.url);
     const path=url.pathname.replace(/\/+$/,"")||"/";
@@ -471,7 +665,16 @@ export default {
     if(path==="/bridge-run"){ if(!okKey) return new Response("unauthorized",{status:401}); const dry=url.searchParams.get("dry")==="1"; return json({ok:true,...await stewardBridge(env,dry)}); }
     if(path==="/desk"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({ok:true,...await readDesk(env)}); }
     if(path==="/cron-run"){ if(!okKey) return new Response("unauthorized",{status:401}); const sc=url.searchParams.get("scope"); if(sc) return json({ok:true,scope:sc,desk:await runScope(env,sc)}); return json({ok:true,...await cronTick(env)}); }
-    if(path==="/send"){ if(!okKey) return new Response("unauthorized",{status:401}); const q=url.searchParams;try{const out=await sendMail(env,q.get("from"),q.get("to"),q.get("subject")||"",q.get("text")||"");return json({ok:true,...out});}catch(e){return json({ok:false,error:String((e&&e.message)||e)});} }
+    if(path==="/send"){ if(!okKey) return new Response("unauthorized",{status:401}); const q=url.searchParams;try{const out=await sendMail(env,q.get("from"),q.get("to"),q.get("subject")||"",q.get("text")||"",{agent:q.get("agent"),arc:q.get("arc"),lane:q.get("lane"),hold:q.get("hold")});return json({ok:true,...out});}catch(e){return json({ok:false,error:String((e&&e.message)||e)});} }
+    // The standards are public on purpose: anyone who receives mail from the
+    // Fort can read what the Fort holds itself to, and check it against what
+    // landed in their inbox.
+    if(path==="/ambassador"){ const lanes={};for(const k of Object.keys(LANES))lanes[k]=await getLane(env,k); return json({standards:AMBASSADOR,lanes}); }
+    if(path==="/outbox"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({ok:true,pending:await outboxList(env)}); }
+    // The kill switch. Deliberately a GET so it is one tap from a phone while
+    // the feeling is still happening — ?id=<id> or ?id=all.
+    if(path==="/outbox/kill"){ if(!okKey) return new Response("unauthorized",{status:401}); try{return json({ok:true,...await outboxKill(env,url.searchParams.get("id")||"")});}catch(e){return json({ok:false,error:String((e&&e.message)||e)});} }
+    if(path==="/outbox/drain"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({ok:true,...await outboxDrain(env)}); }
     if(path==="/wallet-provision"){
       if(!okKey) return new Response("unauthorized",{status:401});
       const addrs=(url.searchParams.get("addrs")||"").split(",").map(s=>s.trim()).filter(Boolean);const host=url.searchParams.get("host");const smtp=url.searchParams.get("smtp")||"";

@@ -71,6 +71,51 @@ ask for exactly that thing, then continue.
 - Docs live in `docs/`; keep README endpoint tables in sync with `worker.js`
   routes when you change either.
 
+## ⚠ Before you ever send mail: SHOW YOUR A.S.S.
+
+Fortmail will not let an agent write to a human outside the Fort anonymously,
+and it will not let a message leave the instant you decide to send it. Two
+protections live in `sendMail()`, the single chokepoint every send path funnels
+through, and **neither is a confirmation dialog** — a confirmation that a stray
+keypress can answer is not consent, in either direction.
+
+**1 · The A.S.S. handshake is enforced, not remembered.** Outward mail requires:
+
+| | |
+|---|---|
+| **Arc** | `arc` — one line on what thread this send belongs to. Stored with the message forever, so every send carries a record of what the agent believed it was doing. |
+| **Self** | `agent` — which agent you are (`river`, `nova`, `gpt`, `codex`, `mistral`). |
+| **Lane** | `lane` — which errand, and the manners and hold that come with it. |
+
+**2 · The signature is automatic and you cannot suppress it.** Every outward
+message says a machine sent it, names which one, and names whose behalf. An
+agent must never be able to pass as the operator typing.
+
+**3 · The hold, not a dialog.** Outward mail is queued, not sent; the cron
+drains it once the lane's hold elapses. What kills a message sent in anger is
+*time* — the mood passes, the mail has not left, and the person who shows up
+fifteen minutes later gets a vote. `outbox` shows what is pending, `outbox_kill`
+stops it (pass `all` to dump everything). Meant to be usable in ten seconds
+from a phone: `GET /outbox/kill?id=all&key=...`.
+
+**Lanes:** `jimmy` (personal, 15m) · `business` (default, 15m) · `support`
+(inbound replies, 5m) · `legal` — **blocked at the worker**. Anything touching a
+claim, counsel, a court, an adjuster or an insurer is the operator's to send
+himself, from his own hands. Override any lane without a deploy by writing
+`lane:<slug>` into KV.
+
+**Read `GET /ambassador` (or the `ambassador` MCP tool) before your first
+send.** It serves the Ambassador Social Standards — how a Fort agent conducts
+itself when it speaks for a human to the outside world — from the worker, so
+every door reads the same text rather than its own memory of it. A standard an
+agent recalls is a standard that drifts. The short version: say what you are,
+never send on a mood, never send in anger, underclaim, disclose only the
+errand, and anything that cannot be taken back belongs to the human.
+
+The standards are served **unauthenticated on purpose** — anyone who receives
+mail from this Fort can read what it holds itself to and check it against what
+landed in their inbox.
+
 ## Operating it after deploy
 
 Read `docs/AGENT.md` — tool list, a suggested working loop, and standing
