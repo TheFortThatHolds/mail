@@ -392,7 +392,7 @@ async function imapVerify(host,user,pass){
   }
   return {ok:false,error:last};
 }
-async function walletRotate(env,addr){
+async function rotateMailbox(env,addr){
   const a=String(addr||"").trim().toLowerCase();
   if(!a||!a.includes("@"))throw new Error("need addr — a provisioned IMAP mailbox address");
   const raw=await env.TOKENS.get("imap:"+a);
@@ -424,7 +424,27 @@ async function walletRotate(env,addr){
   rec.rotation.state="done";rec.rotation.verified_attempts=v.attempts;
   await env.TOKENS.put("imap:"+a,JSON.stringify(rec));
   await env.TOKENS.put("audit:rotate:"+a+":"+Date.now(),JSON.stringify({addr:a,ts:Date.now(),state:"done"}),{expirationTtl:60*60*24*90});
-  return {ok:true,addr:a,rotated:true,verified_imap:true};
+  return {addr:a,password:pw};
+}
+async function walletRotate(env,addr){
+  const r=await rotateMailbox(env,addr);
+  return {ok:true,addr:r.addr,rotated:true,verified_imap:true};
+}
+// ---- Break-glass: the human needs into the mailbox themselves --------------
+// (e.g. tapping a magic link in the inbox). Rotates the password, then issues
+// a SINGLE-USE, short-lived link the owner opens to see it. The link carries
+// only a random token — the password is never in chat, logs, or the audit
+// trail, and the token burns on first view. The agent's sealed copy stays in
+// sync, so nothing else breaks.
+async function breakglass(env,addr,ttlMin){
+  const r=await rotateMailbox(env,addr);
+  const token=tok(32);
+  const ttlSec=Math.max(5,Math.min(60,parseInt(ttlMin)||15))*60;
+  await env.TOKENS.put("breakglass:"+token,JSON.stringify({addr:r.addr,sealed:await seal(env,r.password),ts:Date.now()}),{expirationTtl:ttlSec});
+  const origin="https://"+(env.PUBLIC_HOST||"");
+  await env.TOKENS.put("audit:breakglass:"+r.addr+":"+Date.now(),JSON.stringify({addr:r.addr,ts:Date.now(),ttl_sec:ttlSec}),{expirationTtl:60*60*24*90});
+  return {ok:true,addr:r.addr,link:origin+"/breakglass?token="+token,expires_in_min:ttlSec/60,
+    note:"Single-use: opening it shows the password once, then the link burns. Do not forward it."};
 }
 // ---- The outbox -----------------------------------------------------------
 async function outboxIdx(env){const a=await env.TOKENS.get("outbox");return a?JSON.parse(a):[];}
@@ -634,7 +654,8 @@ const TOOLS=[
   // news_send can blast an entire list — so exposing create here is consistent, not an
   // escalation. Same validation as the HTTP route, including the CAN-SPAM postal address.
   {name:"news_list_create",description:"Newsletter: create or update a list. slug is lowercase a-z 0-9 dashes. from is a full From header (e.g. \"The Fort <fort@example.com>\"). address is the physical mailing address REQUIRED by CAN-SPAM in every send. Re-running with an existing slug updates it and preserves its created date and subscribers.",inputSchema:{type:"object",properties:{slug:{type:"string"},name:{type:"string"},from:{type:"string"},reply_to:{type:"string"},address:{type:"string"}},required:["slug","name","from","address"]}},
-  {name:"wallet_rotate",description:"Rotate a provisioned IMAP mailbox's password server-side (Migadu): mints a strong password inside the worker, pushes it via the Fort Card broker, verifies IMAP login, then seals the new password. Repairs a mailbox the owner touched outside the flow (manual provider reset). Returns status only — never the password.",inputSchema:{type:"object",properties:{address:{type:"string",description:"The provisioned IMAP mailbox address to rotate."}},required:["address"]}}
+  {name:"wallet_rotate",description:"Rotate a provisioned IMAP mailbox's password server-side (Migadu): mints a strong password inside the worker, pushes it via the Fort Card broker, verifies IMAP login, then seals the new password. Repairs a mailbox the owner touched outside the flow (manual provider reset). Returns status only — never the password.",inputSchema:{type:"object",properties:{address:{type:"string",description:"The provisioned IMAP mailbox address to rotate."}},required:["address"]}},
+  {name:"breakglass",description:"Break-glass human access to a provisioned IMAP mailbox: rotates the password server-side, then issues a SINGLE-USE short-lived link the owner opens to see it (e.g. to tap a magic link in the inbox themselves). Returns the link, never the password. The agent's sealed copy stays in sync.",inputSchema:{type:"object",properties:{address:{type:"string",description:"The provisioned IMAP mailbox address."},ttl_min:{type:"number",description:"Link lifetime in minutes (5-60, default 15)."}},required:["address"]}}
 ];
 async function callTool(env,name,args){
   args=args||{};
@@ -684,6 +705,11 @@ async function callTool(env,name,args){
     const a=String(args.address||"").trim();
     if(!a)throw new Error("address required — the provisioned IMAP mailbox to rotate");
     return await walletRotate(env,a);
+  }
+  if(name==="breakglass"){
+    const a=String(args.address||"").trim();
+    if(!a)throw new Error("address required — the provisioned IMAP mailbox to open");
+    return await breakglass(env,a,args.ttl_min);
   }
   throw new Error("unknown tool "+name);
 }
@@ -784,6 +810,28 @@ export default {
       if(!addr) return json({ok:false,error:"need addr (a provisioned IMAP mailbox)"},400);
       try{return json({ok:true,...await walletRotate(env,addr)});}
       catch(e){return json({ok:false,error:String((e&&e.message)||e)},500);}
+    }
+    // Break-glass issuance (key-gated): rotate + mint a single-use link.
+    // GET for one-tap phone use, POST with {"addr":...,"ttl_min":...}.
+    if(path==="/breakglass"&&!url.searchParams.get("token")){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      let addr=(url.searchParams.get("addr")||"").trim();let ttlMin=url.searchParams.get("ttl_min")||"";
+      if(request.method==="POST"){const p=await request.json().catch(()=>({}));addr=(p.addr||addr||"").trim();ttlMin=p.ttl_min||ttlMin||"";}
+      if(!addr) return json({ok:false,error:"need addr (a provisioned IMAP mailbox)"},400);
+      try{return json({ok:true,...await breakglass(env,addr,ttlMin)});}
+      catch(e){return json({ok:false,error:String((e&&e.message)||e)},500);}
+    }
+    // Break-glass view: the token IS the auth. Burns on first view.
+    if(path==="/breakglass"&&url.searchParams.get("token")){
+      const t=url.searchParams.get("token");
+      const raw=await env.TOKENS.get("breakglass:"+t);
+      if(!raw)return html("<h3>Link expired</h3><p>This break-glass link is expired or already used. Ask your agent for a fresh one.</p>");
+      await env.TOKENS.delete("breakglass:"+t);
+      let pw="";let who="";
+      try{const rec=JSON.parse(raw);who=rec.addr||"";pw=await unseal(env,rec.sealed);}catch(e){return html("<h3>Link invalid</h3><p>Could not open this break-glass link.</p>");}
+      return html("<h3>Mailbox access — one-time</h3><p>Sign in as <b>"+esc(who)+"</b> with:</p>"+
+        '<p><input readonly value="'+esc(pw)+'" onclick="this.select()" style="font-size:18px;width:92%;padding:8px"/></p>'+
+        "<p style=\"color:#666\">Tap the password to select it, then copy. This link is now burned — it will not open again.</p>");
     }
     if(path==="/imapboxes"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({boxes:await listImap(env)}); }
     if(path==="/accounts"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({gmail:await listAccounts(env),imap:await listImap(env)}); }
