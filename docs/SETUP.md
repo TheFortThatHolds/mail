@@ -146,7 +146,9 @@ is marked `\Seen` only after filing succeeds — nothing gets lost to a crash.
 ## Troubleshooting
 
 - **`login failed` on an IMAP box** — the sealed password doesn't match the
-  provider. Re-run `/wallet-provision` for that box and set the new `setpw`
+  provider. For Migadu boxes, `/wallet-rotate?key=&addr=` fixes it
+  server-side (mint + push + verify, no manual password handling). Otherwise
+  re-run `/wallet-provision` for that box and set the new `setpw`
   at the provider (or `/wallet-import` the real one).
 - **Gmail `No refresh token`** — Google only issues a refresh token on the
   first consent. Remove the app at `myaccount.google.com/permissions`, then

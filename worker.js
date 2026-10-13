@@ -354,6 +354,78 @@ async function isInternal(env,addr){
   const extra=(env.INTERNAL_DOMAINS||"").split(",").map(s=>s.trim().toLowerCase()).filter(Boolean);
   return extra.some(d=>a.endsWith("@"+d));
 }
+// ---- Mailbox password rotation (Migadu) -----------------------------------
+// The break-glass the owner asked for: an agent-operated, server-side password
+// rotation for Migadu-backed mailboxes, so nobody ever has to log into Migadu
+// and hand-type a password again.
+//
+// Flow: mint a strong password INSIDE the worker -> seal it as PENDING
+// (crash-safe; the old sealed password stays live until the very end) ->
+// push it to Migadu through the Fort Card broker (the worker never holds the
+// Migadu admin key) -> verify IMAP login with the new password, retrying for
+// propagation -> promote pending to active. Returns status only — never the
+// password. A mailbox the owner touched outside this flow (manual Migadu
+// reset, provider-side change) is repaired by the same operation: the admin
+// push overwrites whatever is currently set, so the old password is never
+// needed.
+async function migaduApi(env,method,path,body){
+  const brokerUrl=(env.MIGADU_BROKER_URL||env.RELAY_BROKER_URL||"").replace(/\/+$/,"");
+  const brokerRepo=env.MIGADU_BROKER_REPO||env.RELAY_BROKER_REPO||"";
+  const card=env.MIGADU_BROKER_CARD||"";
+  if(!brokerUrl||!brokerRepo||!card)
+    throw new Error("mailbox rotation not configured — set MIGADU_BROKER_CARD to the Fort Card Migadu management card (broker URL/repo fall back to RELAY_BROKER_URL/RELAY_BROKER_REPO)");
+  const r=await fetch(brokerUrl+"/agent/use",{method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify({repo:brokerRepo,card,request:{url:"https://api.migadu.com/v1"+path,method,headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined}})});
+  const j=await r.json().catch(()=>({}));
+  if(j.authorized===false)throw new Error("migadu card declined: "+(j.decline_reason||"unknown"));
+  if(!r.ok||(typeof j.status==="number"&&j.status>=400))
+    throw new Error("migadu api "+(j.status||r.status)+": "+JSON.stringify(j.body||{}).slice(0,300));
+  return j.body||{};
+}
+async function imapVerify(host,user,pass){
+  // Migadu applies password changes fast, but verify anyway — up to ~30s.
+  const waits=[0,3000,6000,9000,12000];let last="";
+  for(let i=0;i<waits.length;i++){
+    if(waits[i])await new Promise(r=>setTimeout(r,waits[i]));
+    try{const o=await imapConn(host,user,pass);await imapClose(o);return {ok:true,attempts:i+1};}
+    catch(e){last=String((e&&e.message)||e).slice(0,120);}
+  }
+  return {ok:false,error:last};
+}
+async function walletRotate(env,addr){
+  const a=String(addr||"").trim().toLowerCase();
+  if(!a||!a.includes("@"))throw new Error("need addr — a provisioned IMAP mailbox address");
+  const raw=await env.TOKENS.get("imap:"+a);
+  if(!raw)throw new Error("unknown mailbox "+a+" — only provisioned IMAP boxes can be rotated");
+  const rec=JSON.parse(raw);
+  const at=a.indexOf("@");const local=a.slice(0,at),domain=a.slice(at+1);
+  // 1. Mint + seal the replacement BEFORE touching the provider (crash-safe).
+  const pw=genpw();
+  rec.sealed_pending=await seal(env,pw);
+  rec.rotation={ts:Date.now(),state:"pending"};
+  await env.TOKENS.put("imap:"+a,JSON.stringify(rec));
+  // 2. Push to Migadu (admin route — overwrites whatever is currently set).
+  try{
+    await migaduApi(env,"PUT","/domains/"+encodeURIComponent(domain)+"/mailboxes/"+encodeURIComponent(local),{password:pw});
+  }catch(e){
+    rec.rotation.state="provider_failed";rec.rotation.error=String((e&&e.message)||e).slice(0,300);
+    await env.TOKENS.put("imap:"+a,JSON.stringify(rec));
+    throw new Error("rotation aborted at the provider ("+rec.rotation.error+") — the old sealed password is untouched");
+  }
+  // 3. Prove the new password works before trusting it.
+  const v=await imapVerify(rec.host,rec.user,pw);
+  if(!v.ok){
+    rec.rotation.state="verify_failed";rec.rotation.error=v.error;
+    await env.TOKENS.put("imap:"+a,JSON.stringify(rec));
+    throw new Error("Migadu accepted the new password but IMAP login did not verify ("+v.error+") — sealed PENDING copy retained for reconciliation; the old password is no longer valid at the provider");
+  }
+  // 4. Promote pending -> active. Only now does the old password die.
+  rec.sealed=rec.sealed_pending;delete rec.sealed_pending;
+  rec.rotation.state="done";rec.rotation.verified_attempts=v.attempts;
+  await env.TOKENS.put("imap:"+a,JSON.stringify(rec));
+  await env.TOKENS.put("audit:rotate:"+a+":"+Date.now(),JSON.stringify({addr:a,ts:Date.now(),state:"done"}),{expirationTtl:60*60*24*90});
+  return {ok:true,addr:a,rotated:true,verified_imap:true};
+}
 // ---- The outbox -----------------------------------------------------------
 async function outboxIdx(env){const a=await env.TOKENS.get("outbox");return a?JSON.parse(a):[];}
 async function outboxPut(env,item){
@@ -561,7 +633,8 @@ const TOOLS=[
   // could only be born from a shell holding the key. This door is already admin —
   // news_send can blast an entire list — so exposing create here is consistent, not an
   // escalation. Same validation as the HTTP route, including the CAN-SPAM postal address.
-  {name:"news_list_create",description:"Newsletter: create or update a list. slug is lowercase a-z 0-9 dashes. from is a full From header (e.g. \"The Fort <fort@example.com>\"). address is the physical mailing address REQUIRED by CAN-SPAM in every send. Re-running with an existing slug updates it and preserves its created date and subscribers.",inputSchema:{type:"object",properties:{slug:{type:"string"},name:{type:"string"},from:{type:"string"},reply_to:{type:"string"},address:{type:"string"}},required:["slug","name","from","address"]}}
+  {name:"news_list_create",description:"Newsletter: create or update a list. slug is lowercase a-z 0-9 dashes. from is a full From header (e.g. \"The Fort <fort@example.com>\"). address is the physical mailing address REQUIRED by CAN-SPAM in every send. Re-running with an existing slug updates it and preserves its created date and subscribers.",inputSchema:{type:"object",properties:{slug:{type:"string"},name:{type:"string"},from:{type:"string"},reply_to:{type:"string"},address:{type:"string"}},required:["slug","name","from","address"]}},
+  {name:"wallet_rotate",description:"Rotate a provisioned IMAP mailbox's password server-side (Migadu): mints a strong password inside the worker, pushes it via the Fort Card broker, verifies IMAP login, then seals the new password. Repairs a mailbox the owner touched outside the flow (manual provider reset). Returns status only — never the password.",inputSchema:{type:"object",properties:{address:{type:"string",description:"The provisioned IMAP mailbox address to rotate."}},required:["address"]}}
 ];
 async function callTool(env,name,args){
   args=args||{};
@@ -606,6 +679,11 @@ async function callTool(env,name,args){
     const log=JSON.parse(await env.TOKENS.get("news:camps")||"[]");const out=[];
     for(const cid of log.slice(0,10)){const c=await env.TOKENS.get("news:camp:"+cid);if(c){const j=JSON.parse(c);out.push({id:j.id,list:j.list,subject:j.subject,status:j.status,sent:j.sent,errors:j.errors});}}
     return {campaigns:out,pending:await newsCampQ(env)};
+  }
+  if(name==="wallet_rotate"){
+    const a=String(args.address||"").trim();
+    if(!a)throw new Error("address required — the provisioned IMAP mailbox to rotate");
+    return await walletRotate(env,a);
   }
   throw new Error("unknown tool "+name);
 }
@@ -695,6 +773,17 @@ export default {
       await env.TOKENS.put("imap:"+addr,JSON.stringify(rec));
       const boxes=await listImap(env);if(!boxes.includes(addr)){boxes.push(addr);await env.TOKENS.put("imapboxes",JSON.stringify(boxes));}
       return json({ok:true,imported:addr});
+    }
+    // Server-side password rotation (Migadu): mint + seal + push + verify.
+    // Repairs a mailbox the owner touched outside the flow. GET for one-tap
+    // phone use, POST with {"addr":...} for scripts. Returns status only.
+    if(path==="/wallet-rotate"){
+      if(!okKey) return new Response("unauthorized",{status:401});
+      let addr=(url.searchParams.get("addr")||"").trim();
+      if(request.method==="POST"){const p=await request.json().catch(()=>({}));addr=(p.addr||addr||"").trim();}
+      if(!addr) return json({ok:false,error:"need addr (a provisioned IMAP mailbox)"},400);
+      try{return json({ok:true,...await walletRotate(env,addr)});}
+      catch(e){return json({ok:false,error:String((e&&e.message)||e)},500);}
     }
     if(path==="/imapboxes"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({boxes:await listImap(env)}); }
     if(path==="/accounts"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({gmail:await listAccounts(env),imap:await listImap(env)}); }

@@ -127,6 +127,7 @@ consequential, gate on your explicit approval, not on a From header.
 | `/send?key=&from=&to=&subject=&text=` | Send as any owned box |
 | `/wallet-provision?key=&addrs=&host=&smtp=` | Mint + seal new IMAP creds |
 | `/wallet-import?key=&addr=&host=&smtp=` | Seal an existing password (via `X-Mailbox-Password` header) |
+| `/wallet-rotate?key=&addr=` | Rotate a Migadu mailbox password server-side: mint + seal + push + verify (also the `wallet_rotate` MCP tool). Repairs boxes touched outside the flow |
 | `/accounts?key=` / `/imapboxes?key=` | List owned boxes |
 | `/tool?key=&name=` | Call any MCP tool over HTTP (`GET` query or `POST` JSON `{name,arguments}`) — same `TRIGGER_KEY` as `/accounts` |
 | `/attachment?key=&address=&message=&attachmentId=` | Fetch one Gmail attachment as raw bytes (`Content-Type` from the part). `encoding=base64` returns JSON instead. Read-only; 4MB cap on JSON/tool payloads |
