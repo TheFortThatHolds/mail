@@ -185,3 +185,5 @@ None of that is required to run Fortmail.
 ## License
 
 [MIT](LICENSE) © The Fort That Holds LLC.
+
+This project is built and maintained by Jimmy Thornburg, with Nova, his AI assistant.
