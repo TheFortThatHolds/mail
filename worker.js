@@ -11,6 +11,7 @@
 //
 // Open source (MIT) from The Fort That Holds LLC. See README.md for setup.
 import { connect } from "cloudflare:sockets";
+import { WorkerEntrypoint } from "cloudflare:workers";
 const SCOPE = "https://mail.google.com/";
 const QUERY = "in:inbox newer_than:90d";
 const DAYS=90;
@@ -510,6 +511,7 @@ async function sendNow(env,from,to,subject,text){
 async function sendMail(env,from,to,subject,text,opts){
   opts=opts||{};
   const lane=await getLane(env,opts.lane);
+  const river=(opts.river&&typeof opts.river==="object")?opts.river:null;
   const agent=String(opts.agent||"").trim();
   const arc=String(opts.arc||"").trim();
   // SHOW YOUR A.S.S. — Arc / Self / Lane, the Core's boundary handshake. Mail
@@ -530,12 +532,12 @@ async function sendMail(env,from,to,subject,text,opts){
   if(await isInternal(env,to))return {via:"internal",...await sendNow(env,from,to,subject,text)};
   const body=String(text||"")+signature(env,agent,lane);
   const holdMin=opts.hold!=null?Math.max(0,parseInt(opts.hold)):(lane.hold!=null?lane.hold:15);
-  if(holdMin===0){await env.TOKENS.put("sent:"+tok(8),JSON.stringify({from,to,subject,ass:{arc,self:agent,lane:lane.slug},ts:Date.now()}),{expirationTtl:60*60*24*90});
+  if(holdMin===0){await env.TOKENS.put("sent:"+tok(8),JSON.stringify({from,to,subject,ass:{arc,self:agent,lane:lane.slug},...(river?{river}:{}),ts:Date.now()}),{expirationTtl:60*60*24*90});
     return {held:false,...await sendNow(env,from,to,subject,body)};}
   const id=tok(8);
   const item={id,from,to,subject:subject||"",body,
               ass:{arc,self:agent,lane:lane.slug},
-              agent,lane:lane.slug,
+              agent,lane:lane.slug,...(river?{river}:{}),
               queued:Date.now(),due:Date.now()+holdMin*60*1000,status:"held",tries:0};
   await outboxPut(env,item);
   return {held:true,id,releases_in_minutes:holdMin,to,subject:item.subject,
@@ -672,7 +674,7 @@ async function callTool(env,name,args){
     if(att.bytes.length>ATTACH_JSON_MAX)throw new Error("attachment too large for tool JSON ("+att.bytes.length+" bytes). GET /attachment?address="+encodeURIComponent(a)+"&message="+encodeURIComponent(uid)+"&attachmentId="+encodeURIComponent(aid));
     return {address:a,message:att.id,filename:att.filename,mimeType:att.mimeType,size:att.size,encoding:"base64",data:bytesToB64(att.bytes)};
   }
-  if(name==="send")return await sendMail(env,args.from,args.to,args.subject,args.text,{agent:args.agent,arc:args.arc,lane:args.lane,hold:args.hold});
+  if(name==="send")return await sendMail(env,args.from,args.to,args.subject,args.text,{agent:args.agent,arc:args.arc,lane:args.lane,hold:args.hold,river:args.__river});
   if(name==="ambassador"){const lanes={};for(const k of Object.keys(LANES))lanes[k]=await getLane(env,k);return {standards:ambassadorText(env),lanes,hold:"Outward mail is queued, not sent. It leaves when the hold elapses and the cron next runs. Kill it with outbox_kill before then and it never happened.",signature:"Appended to every outward message. Not suppressible by the caller."};}
   if(name==="outbox")return {pending:await outboxList(env)};
   if(name==="outbox_kill")return await outboxKill(env,String(args.id||""));
@@ -692,7 +694,7 @@ async function callTool(env,name,args){
     if(!args.subject||(!args.html&&!args.text))throw new Error("need subject and html or text");
     const origin="https://"+(env.PUBLIC_HOST||"");if(!env.PUBLIC_HOST)throw new Error("set the PUBLIC_HOST var (this worker's public hostname) so unsubscribe links in MCP-queued campaigns resolve");
     if(args.test){if(!EMAIL_RE.test(args.test))throw new Error("bad test address");return {test:args.test,relay:await newsSendOne(env,list,{email:args.test,ut:"test",status:"confirmed"},{origin,subject:"[TEST] "+args.subject,html:args.html,text:args.text})};}
-    const camp={id:tok(12),list:list.slug,subject:args.subject,html:args.html||"",text:args.text||"",origin,created:Date.now(),status:"queued",cursor:null,sent:0,errors:0};
+    const camp={id:tok(12),list:list.slug,subject:args.subject,html:args.html||"",text:args.text||"",origin,created:Date.now(),status:"queued",cursor:null,sent:0,errors:0,...((args.__river&&typeof args.__river==="object")?{river:args.__river}:{})};
     await newsQueue(env,camp);return {queued:camp.id};
   }
   if(name==="news_status"){
@@ -721,6 +723,15 @@ async function mcpHandle(env,req){
   if(m==="tools/list")return {jsonrpc:"2.0",id,result:{tools:TOOLS}};
   if(m==="tools/call"){try{const out=await callTool(env,req.params.name,req.params.arguments);return {jsonrpc:"2.0",id,result:{content:[{type:"text",text:JSON.stringify(out,null,2)}]}};}catch(e){return {jsonrpc:"2.0",id,result:{isError:true,content:[{type:"text",text:String((e&&e.message)||e)}]}};}}
   return {jsonrpc:"2.0",id,error:{code:-32601,message:"method not found: "+m}};
+}
+// Begin the Gmail account connect flow: mint a single-use OAuth state and
+// redirect to Google consent. Shared by /connect (key-gated) and
+// /connect-link (single-use token-gated) so both run the identical flow.
+async function startGmailConnect(env,redirectUri){
+  const state=crypto.randomUUID().replace(/-/g,"");await env.TOKENS.put("state:"+state,"1",{expirationTtl:600});
+  const auth=new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  auth.searchParams.set("client_id",env.GMAIL_CLIENT_ID);auth.searchParams.set("redirect_uri",redirectUri);auth.searchParams.set("response_type","code");auth.searchParams.set("scope",SCOPE);auth.searchParams.set("access_type","offline");auth.searchParams.set("prompt","consent");auth.searchParams.set("state",state);
+  return Response.redirect(auth.toString(),302);
 }
 export default {
   async scheduled(event,env,ctx){ ctx.waitUntil((async()=>{try{await cronTick(env);}catch(e){}try{await stewardBridge(env,false);}catch(e){}try{await newsDrain(env);}catch(e){}try{await outboxDrain(env);}catch(e){}})()); },
@@ -991,10 +1002,24 @@ export default {
     }
     if(path==="/connect"){
       if(!okKey) return new Response("unauthorized",{status:401});
-      const state=crypto.randomUUID().replace(/-/g,"");await env.TOKENS.put("state:"+state,"1",{expirationTtl:600});
-      const auth=new URL("https://accounts.google.com/o/oauth2/v2/auth");
-      auth.searchParams.set("client_id",env.GMAIL_CLIENT_ID);auth.searchParams.set("redirect_uri",redirectUri);auth.searchParams.set("response_type","code");auth.searchParams.set("scope",SCOPE);auth.searchParams.set("access_type","offline");auth.searchParams.set("prompt","consent");auth.searchParams.set("state",state);
-      return Response.redirect(auth.toString(),302);
+      return startGmailConnect(env,redirectUri);
+    }
+    if(path==="/connect-link"){
+      // Single-use, 10-minute Gmail connect links (River Reconstruction queue
+      // #17). POST mints (trigger-key gated; the key never appears in the
+      // link). GET redeems: the token is burned BEFORE the redirect, then the
+      // identical /connect flow runs — credential stays server-side.
+      if(request.method==="POST"){
+        if(!okKey) return new Response("unauthorized",{status:401});
+        const t=tok(24);await env.TOKENS.put("connectlink:"+t,"1",{expirationTtl:600});
+        return json({ok:true,url:origin+"/connect-link?t="+t,expires_in:600});
+      }
+      const t=url.searchParams.get("t")||"";
+      if(!/^[A-Za-z0-9_-]{16,64}$/.test(t)) return html("<p>Invalid or expired link. Ask for a fresh connect link.</p>");
+      const held=await env.TOKENS.get("connectlink:"+t);
+      if(!held) return html("<p>Invalid or expired link. Ask for a fresh connect link.</p>");
+      await env.TOKENS.delete("connectlink:"+t);
+      return startGmailConnect(env,redirectUri);
     }
     if(path==="/oauth/callback"){
       const code=url.searchParams.get("code"),state=url.searchParams.get("state");if(!code||!state) return html('<p>Missing code/state.</p>');
@@ -1004,3 +1029,50 @@ export default {
     return new Response("not found",{status:404});
   },
 };
+
+// ── RiverMailPort — the River (fort-router) service-binding door.
+// River Reconstruction W2: the router prepares a single-use Core handoff; this
+// port verifies it through the Core mail authority binding (CORE_MAIL_AUTH)
+// and then dispatches to the EXISTING callTool — same store, same sixteen
+// tools, no second mail system. Reads ride read(); writes ride save() and are
+// shaped to the router's saved/queued result contract.
+const MAIL_READ_OPS=["list_accounts","get_desk","triage","read_box","read_message","get_attachment","ambassador","outbox","news_lists","news_status"];
+const MAIL_SEND_OPS=["send","outbox_kill"];
+const MAIL_ADMIN_OPS=["news_send","news_list_create","wallet_rotate","breakglass"];
+function riverMailValidate(handoff,request,writing){
+  const bad=()=>{throw new Error("Invalid River mail request.");};
+  if(typeof handoff!=="string"||!/^rhand_[a-f0-9]{64}$/.test(handoff))bad();
+  if(!request||typeof request!=="object"||Array.isArray(request))bad();
+  if(request.domain!=="mail"||typeof request.operation!=="string")bad();
+  const allowed=writing?MAIL_SEND_OPS.concat(MAIL_ADMIN_OPS):MAIL_READ_OPS;
+  if(!allowed.includes(request.operation))bad();
+  if(typeof request.query!=="string"||request.query.length>2000)bad();
+  if(request.args!==undefined&&(typeof request.args!=="object"||request.args===null||Array.isArray(request.args)))bad();
+  if(JSON.stringify(request).length>12000)bad();
+}
+async function riverMailDispatch(env,handoff,request,writing){
+  riverMailValidate(handoff,request,writing);
+  if(!env.CORE_MAIL_AUTH)throw new Error("River mail authority is not connected.");
+  const verified=writing?await env.CORE_MAIL_AUTH.consumeWrite(handoff,request):await env.CORE_MAIL_AUTH.consume(handoff,request);
+  if(!verified||verified.ok!==true||verified.protocol!==1)throw new Error("River mail request is not authorized or available.");
+  // Chain link (R1 merge): the link id is the digest of the shared handoff —
+  // Core binds the same token to the request hash in its audit chain, so this
+  // receipt and the router-action receipt are two faces of ONE link.
+  const digest=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(handoff));
+  const link=Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,"0")).join("");
+  const args=Object.assign({},request.args||{});
+  // Provenance is injected HERE, after Core verification — never accepted
+  // from the client — and stamped into the mail ledger (outbox item, sent
+  // record, campaign) so the write carries its origin in Fort Mail itself.
+  if(request.operation==="send"||request.operation==="news_send")
+    args.__river={link:link,origin:"river",principal:{user:verified.principal&&verified.principal.user,space:verified.principal&&verified.principal.space},at:new Date().toISOString()};
+  const out=await callTool(env,request.operation,args);
+  const base=(out&&typeof out==="object"&&!Array.isArray(out))?out:{result:out};
+  const queued=request.operation==="send"||request.operation==="news_send";
+  const data=writing?Object.assign({},base,{saved:!queued,queued:queued}):base;
+  return {ok:true,data:data,receipt:{id:"fort-mail:"+link.slice(0,24),source:"fort-mail/RiverMailPort",at:new Date().toISOString(),link:link}};
+}
+export class RiverMailPort extends WorkerEntrypoint{
+  async read(handoff,request){return riverMailDispatch(this.env,handoff,request,false);}
+  async save(handoff,request){return riverMailDispatch(this.env,handoff,request,true);}
+}
