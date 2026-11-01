@@ -13,6 +13,14 @@
   // The one store: Gmail refresh tokens (gmail:<addr>), sealed IMAP creds
   // (imap:<addr>), the wallet seal key, OAuth clients/codes/tokens for the
   // MCP door, and the cached triage desk (desk:<scope>).
+  // River door (W2, R1 merged mail fabric): Fort Mail verifies router
+  // handoffs through the Core mail authority before dispatching. The LIVE
+  // worker is named "fort-mail" (deployed name wins over the template name
+  // below) and its live bindings are managed on the deployment.
+  "services": [
+    { "binding": "CORE_MAIL_AUTH", "service": "fort-memory-core", "entrypoint": "RouterMailAuthorityPort" }
+  ],
+
   "kv_namespaces": [
     { "binding": "TOKENS", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
   ],
