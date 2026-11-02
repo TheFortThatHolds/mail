@@ -42,8 +42,11 @@ async function addAccount(env,email){const a=await listAccounts(env);if(!a.inclu
 async function listImap(env){const a=await env.TOKENS.get("imapboxes");return a?JSON.parse(a):[];}
 // Triage scopes are derived, never hardcoded: "gmail" + one scope per IMAP domain.
 async function getScopes(env){const domains=[...new Set((await listImap(env)).map(a=>a.split("@")[1]).filter(Boolean))];return ["gmail",...domains];}
-async function imapConn(host,user,pass){
+async function imapConn(host,user,pass,timeoutMs=0){
   const sock=connect({hostname:host,port:993},{secureTransport:"on",allowHalfOpen:false});
+  const timer=timeoutMs?setTimeout(()=>{sock.close().catch(()=>{});},timeoutMs):null;
+  let connected=false;
+  try{
   try{await sock.opened;}catch(e){}
   const dec=new TextDecoder(),enc=new TextEncoder();const w=sock.writable.getWriter(),r=sock.readable.getReader();
   const o={buf:"",sock,w,r,enc,dec};
@@ -53,7 +56,8 @@ async function imapConn(host,user,pass){
   await o.send("a1 LOGIN "+user+" "+pass+"\r\n");await o.wait("a1",6000);
   if(!o.buf.includes("\r\na1 OK")){try{await o.send("a9 LOGOUT\r\n");await w.close();}catch(e){}throw new Error("login failed");}
   await o.send("a2 SELECT INBOX\r\n");await o.wait("a2",6000);
-  return o;
+  connected=true;return o;
+  }finally{if(timer)clearTimeout(timer);if(!connected&&timeoutMs)sock.close().catch(()=>{});}
 }
 async function imapClose(o){try{await o.send("aZ LOGOUT\r\n");await o.w.close();}catch(e){}}
 async function imapHeaders(host,user,pass,n){
@@ -369,26 +373,31 @@ async function isInternal(env,addr){
 // reset, provider-side change) is repaired by the same operation: the admin
 // push overwrites whatever is currently set, so the old password is never
 // needed.
-async function migaduApi(env,method,path,body){
+async function migaduApi(env,method,path,body,statusOnly=false){
   const brokerUrl=(env.MIGADU_BROKER_URL||env.RELAY_BROKER_URL||"").replace(/\/+$/,"");
   const brokerRepo=env.MIGADU_BROKER_REPO||env.RELAY_BROKER_REPO||"";
   const card=env.MIGADU_BROKER_CARD||"";
   if(!brokerUrl||!brokerRepo||!card)
     throw new Error("mailbox rotation not configured — set MIGADU_BROKER_CARD to the Fort Card Migadu management card (broker URL/repo fall back to RELAY_BROKER_URL/RELAY_BROKER_REPO)");
-  const r=await fetch(brokerUrl+"/agent/use",{method:"POST",headers:{"content-type":"application/json"},
+  const r=await fetch(brokerUrl+"/agent/use",{method:"POST",headers:{"content-type":"application/json"},...(statusOnly?{signal:AbortSignal.timeout(15000)}:{}),
     body:JSON.stringify({repo:brokerRepo,card,request:{url:"https://api.migadu.com/v1"+path,method,headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined}})});
   const j=await r.json().catch(()=>({}));
+  // Creation must never return or persist provider bodies/errors (they may echo a password).
+  if(statusOnly){
+    if(!r.ok||j.authorized!==true||!Number.isInteger(j.status))throw new Error("provider_unavailable");
+    return {status:j.status,body:j.body};
+  }
   if(j.authorized===false)throw new Error("migadu card declined: "+(j.decline_reason||"unknown"));
   if(!r.ok||(typeof j.status==="number"&&j.status>=400))
     throw new Error("migadu api "+(j.status||r.status)+": "+JSON.stringify(j.body||{}).slice(0,300));
   return j.body||{};
 }
-async function imapVerify(host,user,pass){
+async function imapVerify(host,user,pass,options={}){
   // Migadu applies password changes fast, but verify anyway — up to ~30s.
-  const waits=[0,3000,6000,9000,12000];let last="";
+  const waits=options.waits||[0,3000,6000,9000,12000];let last="";
   for(let i=0;i<waits.length;i++){
     if(waits[i])await new Promise(r=>setTimeout(r,waits[i]));
-    try{const o=await imapConn(host,user,pass);await imapClose(o);return {ok:true,attempts:i+1};}
+    try{const o=await imapConn(host,user,pass,options.timeoutMs||0);if(options.timeoutMs)o.sock.close().catch(()=>{});else await imapClose(o);return {ok:true,attempts:i+1};}
     catch(e){last=String((e&&e.message)||e).slice(0,120);}
   }
   return {ok:false,error:last};
@@ -430,6 +439,85 @@ async function rotateMailbox(env,addr){
 async function walletRotate(env,addr){
   const r=await rotateMailbox(env,addr);
   return {ok:true,addr:r.addr,rotated:true,verified_imap:true};
+}
+// Create once, then reconcile by reading + authenticating, NEVER by resetting.
+// KV is eventually consistent, so concurrent creators derive the SAME strong
+// password with a domain-separated HMAC of the existing random wallet key.
+// Migadu's create-only POST arbitrates existence; no PUT/DELETE is used here.
+async function creationPassword(env,addr){
+  const raw=await env.TOKENS.get("wallet_key");
+  if(!raw)throw new Error("wallet_uninitialized");
+  const key=await crypto.subtle.importKey("raw",ub64(raw),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
+  const bytes=await crypto.subtle.sign("HMAC",key,new TextEncoder().encode("fortmail:create:v1:"+addr));
+  return b64(new Uint8Array(bytes)).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")+"Aa7";
+}
+function creationSettings(box,addr,name){
+  return box&&box.address===addr&&box.name===name&&box.may_receive===true&&box.may_send===true&&
+    box.may_access_imap===true&&box.may_access_pop3===false&&box.may_access_managesieve===false&&
+    box.is_internal===false&&Array.isArray(box.forwardings)&&box.forwardings.length===0;
+}
+async function walletCreate(env,input){
+  if(!input||typeof input!=="object"||Array.isArray(input)||Object.keys(input).some(k=>k!=="addr"&&k!=="name"))
+    return {ok:false,state:"invalid_request"};
+  const {addr,name}=input;
+  if(typeof addr!=="string"||addr.length>254||!/^[a-z0-9][a-z0-9._-]{0,63}@[a-z0-9.-]+\.[a-z]{2,63}$/.test(addr)||
+    typeof name!=="string"||!name.trim()||name.length>80||/[\x00-\x1f\x7f]/.test(name))return {ok:false,state:"invalid_request"};
+  const [local,domain]=addr.split("@");
+  // Creation is confined to domains already connected to this deployment.
+  const boxes=await listImap(env);
+  if(!boxes.some(a=>a.endsWith("@"+domain)))return {ok:false,addr,state:"domain_not_connected"};
+  const journalKey="create:"+addr,activeKey="imap:"+addr;
+  let journal=JSON.parse(await env.TOKENS.get(journalKey)||"null");
+  const active=JSON.parse(await env.TOKENS.get(activeKey)||"null");
+  // Compare plaintext only inside the Worker: concurrent seal() calls have
+  // distinct IVs even though the derived creation password is identical.
+  const matches=async rec=>{
+    if(!journal||rec.host!=="imap.migadu.com"||rec.smtp!=="smtp.migadu.com"||rec.user!==addr)return false;
+    try{return await unseal(env,rec.sealed)===await unseal(env,journal.sealed);}catch(e){return false;}
+  };
+  if((active&&!(await matches(active)))||(!journal&&boxes.includes(addr)))return {ok:false,addr,state:"already_connected"};
+  if(journal&&(journal.version!==1||journal.name!==name||typeof journal.sealed!=="string"))return {ok:false,addr,state:"reconciliation_required"};
+  const path="/domains/"+encodeURIComponent(domain)+"/mailboxes/"+encodeURIComponent(local);
+  let provider=await migaduApi(env,"GET",path,null,true);
+  if(provider.status!==200&&provider.status!==404)return {ok:false,addr,state:"provider_unavailable"};
+  if(!journal){
+    if(provider.status===200)return {ok:false,addr,state:"mailbox_exists"};
+    const alias=await migaduApi(env,"GET","/domains/"+encodeURIComponent(domain)+"/aliases/"+encodeURIComponent(local),null,true);
+    if(alias.status!==404)return {ok:false,addr,state:alias.status===200?"alias_exists":"provider_unavailable"};
+    journal={version:1,name,sealed:await seal(env,await creationPassword(env,addr)),state:"prepared",created:Date.now()};
+    await env.TOKENS.put(journalKey,JSON.stringify(journal));
+  }
+  const save=async state=>{journal.state=state;await env.TOKENS.put(journalKey,JSON.stringify(journal));return {ok:false,addr,state};};
+  if(provider.status===404){
+    // An interrupted/failed POST has an uncertain outcome. Do not submit it again.
+    if(journal.state!=="prepared")return {ok:false,addr,state:"reconciliation_required"};
+    await save("submitting");
+    try{
+      const created=await migaduApi(env,"POST",path.slice(0,path.lastIndexOf("/")),{
+        local_part:local,name,password_method:"password",password:await unseal(env,journal.sealed),
+        may_receive:true,may_send:true,may_access_imap:true,may_access_pop3:false,may_access_managesieve:false,is_internal:false
+      },true);
+      if(created.status<200||created.status>=300)return await save("provider_unconfirmed");
+    }catch(e){return await save("provider_unconfirmed");}
+    await save("created");
+    provider=await migaduApi(env,"GET",path,null,true);
+  }
+  if(provider.status!==200||!creationSettings(provider.body,addr,name))return await save("settings_unverified");
+  // Suppress raw IMAP errors; even a malicious provider cannot echo secrets out.
+  let verified=false;
+  try{verified=(await imapVerify("imap.migadu.com",addr,await unseal(env,journal.sealed),{waits:[0,1000,3000],timeoutMs:8000})).ok;}catch(e){}
+  if(!verified)return await save("verify_failed");
+  const current=JSON.parse(await env.TOKENS.get(activeKey)||"null");
+  if(current&&!(await matches(current)))return {ok:false,addr,state:"already_connected"};
+  if(!current)await env.TOKENS.put(activeKey,JSON.stringify({host:"imap.migadu.com",smtp:"smtp.migadu.com",user:addr,sealed:journal.sealed}));
+  const latest=await listImap(env);
+  if(!latest.includes(addr)){latest.push(addr);await env.TOKENS.put("imapboxes",JSON.stringify(latest));}
+  await save("done");
+  return {ok:true,addr,state:"done",created:true,verified_imap:true};
+}
+function adminKey(request,env,url){
+  if(typeof env.TRIGGER_KEY!=="string"||!env.TRIGGER_KEY)return false;
+  return url.searchParams.get("key")===env.TRIGGER_KEY||request.headers.get("authorization")==="Bearer "+env.TRIGGER_KEY;
 }
 // ---- Break-glass: the human needs into the mailbox themselves --------------
 // (e.g. tapping a magic link in the inbox). Rotates the password, then issues
@@ -738,7 +826,7 @@ export default {
   async fetch(request,env){
     const url=new URL(request.url);
     const path=url.pathname.replace(/\/+$/,"")||"/";
-    const okKey=env.TRIGGER_KEY&&url.searchParams.get("key")===env.TRIGGER_KEY;
+    const okKey=adminKey(request,env,url);
     const redirectUri=url.origin+"/oauth/callback";const origin=url.origin;
     if(request.method==="OPTIONS")return new Response(null,{headers:{"access-control-allow-origin":"*","access-control-allow-methods":"GET,POST,OPTIONS","access-control-allow-headers":"authorization,content-type"}});
     if(path==="/") return html('<h2>Fortmail</h2><p>Agent-operated email. Your agent connects at <code>/mcp</code>.</p><p>Newsletter engine included — you own the list, the relay is a dumb pipe. See docs/NEWSLETTER.md.</p><p><a href="https://github.com/TheFortThatHolds/mail">Source &amp; setup</a></p>');
@@ -791,6 +879,17 @@ export default {
     // the feeling is still happening — ?id=<id> or ?id=all.
     if(path==="/outbox/kill"){ if(!okKey) return new Response("unauthorized",{status:401}); try{return json({ok:true,...await outboxKill(env,url.searchParams.get("id")||"")});}catch(e){return json({ok:false,error:String((e&&e.message)||e)});} }
     if(path==="/outbox/drain"){ if(!okKey) return new Response("unauthorized",{status:401}); return json({ok:true,...await outboxDrain(env)}); }
+    if(path==="/wallet-create"){
+      if(!okKey)return new Response("unauthorized",{status:401});
+      if(request.method!=="POST")return json({ok:false,state:"post_required"},405);
+      try{
+        const reader=request.body&&request.body.getReader();let text="",size=0;const decoder=new TextDecoder();
+        if(reader)while(true){const part=await reader.read();if(part.done)break;size+=part.value.length;if(size>1024){await reader.cancel();return json({ok:false,state:"invalid_request"},400);}text+=decoder.decode(part.value,{stream:true});}
+        const input=JSON.parse(text+decoder.decode());
+        const result=await walletCreate(env,input);
+        return new Response(JSON.stringify(result),{status:result.ok?200:409,headers:{"content-type":"application/json","cache-control":"no-store"}});
+      }catch(e){return new Response(JSON.stringify({ok:false,state:"creation_unconfirmed"}),{status:503,headers:{"content-type":"application/json","cache-control":"no-store"}});}
+    }
     if(path==="/wallet-provision"){
       if(!okKey) return new Response("unauthorized",{status:401});
       const addrs=(url.searchParams.get("addrs")||"").split(",").map(s=>s.trim()).filter(Boolean);const host=url.searchParams.get("host");const smtp=url.searchParams.get("smtp")||"";
@@ -1076,3 +1175,4 @@ export class RiverMailPort extends WorkerEntrypoint{
   async read(handoff,request){return riverMailDispatch(this.env,handoff,request,false);}
   async save(handoff,request){return riverMailDispatch(this.env,handoff,request,true);}
 }
+

@@ -51,6 +51,39 @@ pass `&smtp=smtp.my-provider.com` on either endpoint.
 
 Check what's connected: `curl "$W/imapboxes?key=$KEY"`.
 
+### c) Create a Migadu mailbox without handling its password
+
+Admin routes accept the existing `?key=KEY` authentication or the exact
+`Authorization: Bearer KEY` header injected by Fort Card. A missing or incorrect
+credential is refused. Use the wallet; never obtain or print the raw admin key.
+
+`POST /wallet-create` takes only JSON `{ "addr": "agent@your-domain.com",
+"name": "Agent" }` (maximum 1 KiB). The domain must already have a connected
+IMAP account, and the existing Migadu broker configuration must be present.
+The mailbox has receiving, sending and IMAP enabled; POP3 and ManageSieve
+disabled; no forwarding, invitation, or recovery-email change.
+
+The Worker creates a strong password internally using a domain-separated HMAC
+of the existing random wallet key and mailbox address. Concurrent initial
+requests therefore use the same password despite KV eventual consistency.
+It seals the password before the create-only provider POST, verifies provider
+settings and IMAP access, then adds the sealed credential to FortMail. Responses
+contain status only. Existing mailboxes, aliases, and unrelated credential
+entries are never replaced or reset.
+
+Repeat the identical request to reconcile an interrupted operation. If the
+provider mailbox exists, the retained credential is verified before promotion.
+An uncertain POST is never repeated against an absent mailbox: the response is
+`reconciliation_required`. Preserve `create:<addr>` for diagnosis; do not delete
+the mailbox or journal, rotate a password, or import a placeholder to force a
+retry. `verify_failed` and `settings_unverified` preserve the sealed state and
+can be checked again with the same request. Every successful replay rechecks
+Migadu metadata and IMAP rather than trusting a cached `done` flag.
+
+Run `node --check worker.js`, `node test/wallet-create.mjs`, and
+`node test/gmail-attachments.mjs` before deployment. Preserve every live binding
+and secret, compare uploaded source, and read `/settings` back after deployment.
+
 ## 2. Gmail accounts (optional)
 
 Needs a Google OAuth app — one per Fortmail deployment, all your Gmail
@@ -158,3 +191,4 @@ is marked `\Seen` only after filing succeeds — nothing gets lost to a crash.
 - **A triage of many boxes times out** — use scoped sweeps (`&scope=`,
   `&domain=`), which is exactly what the cron does; `scope=all` on dozens of
   boxes in one HTTP request is the one known way to hit the wall.
+
