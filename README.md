@@ -126,6 +126,7 @@ consequential, gate on your explicit approval, not on a From header.
 | `/cron-run?key=` | Force one cron tick (or `&scope=` a specific one) |
 | `/send?key=&from=&to=&subject=&text=` | Send as any owned box |
 | `/wallet-provision?key=&addrs=&host=&smtp=` | Mint + seal new IMAP creds |
+| `POST /wallet-create` | Create a Migadu mailbox on an already connected domain; JSON `{addr,name}`; server-side password, sealed recovery state, verified IMAP; status only |
 | `/wallet-import?key=&addr=&host=&smtp=` | Seal an existing password (via `X-Mailbox-Password` header) |
 | `/wallet-rotate?key=&addr=` | Rotate a Migadu mailbox password server-side: mint + seal + push + verify (also the `wallet_rotate` MCP tool). Repairs boxes touched outside the flow |
 | `/breakglass?key=&addr=` | Break-glass human access: rotate + issue a single-use short-lived link the owner opens to see the password (also the `breakglass` MCP tool). The link burns on first view |
@@ -187,3 +188,4 @@ None of that is required to run Fortmail.
 [MIT](LICENSE) © The Fort That Holds LLC.
 
 This project is built and maintained by Jimmy Thornburg, with Nova, his AI assistant.
+
