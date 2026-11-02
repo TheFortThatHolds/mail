@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 const source=readFileSync(new URL("../worker.js",import.meta.url),"utf8");
 const logs=[];
 const context=vm.createContext({crypto:webcrypto,Request,Response,Headers,URL,URLSearchParams,TextEncoder,TextDecoder,Uint8Array,AbortSignal,atob,btoa,setTimeout,clearTimeout,WorkerEntrypoint:class{},console:{log:(...x)=>logs.push(x),error:(...x)=>logs.push(x)}});
-vm.runInContext(source.replace(/^import .*;$/gm,"").replace("export default {","const worker = {").replace("export class RiverMailPort","class RiverMailPort")+"\nglobalThis.api={worker,walletCreate,creationPassword,adminKey,setVerify(fn){imapVerify=fn;}};",context);
+vm.runInContext(source.replace(/^import .*;$/gm,"").replace("export default {","const worker = {").replace("export class RiverMailPort","class RiverMailPort")+"\nglobalThis.api={worker,walletCreate,creationPassword,adminKey,listImap,imapCredential,setVerify(fn){imapVerify=fn;}};",context);
 const {api}=context;
 const input={addr:"fixture@example.test",name:"Fixture"};
 function fixture(options={}){
@@ -31,7 +31,7 @@ function fixture(options={}){
     return Response.json({authorized:true,status,body});
   };
   api.setVerify(async(host,user,pw,opts)=>{assert.equal(host,"imap.migadu.com");assert.equal(user,input.addr);assert.ok(opts.timeoutMs<=8000);if(options.verifyThrows)throw new Error(pw);return {ok:!options.verifyFailure&&(!password||pw===password)};});
-  const env={TRIGGER_KEY:"synthetic-admin",MIGADU_BROKER_URL:"https://broker.test",MIGADU_BROKER_REPO:"fixture/repo",MIGADU_BROKER_CARD:"fixture-card",TOKENS:{async get(k){reads++;return map.get(k)??null;},async put(k,v){map.set(k,v);},list(){assert.fail("unbounded scan");}}};
+  const env={TRIGGER_KEY:"synthetic-admin",MIGADU_BROKER_URL:"https://broker.test",MIGADU_BROKER_REPO:"fixture/repo",MIGADU_BROKER_CARD:"fixture-card",TOKENS:{async get(k){reads++;return map.get(k)??null;},async put(k,v){map.set(k,v);},async list(query){assert.equal(query.prefix,"imap-created:");assert.equal(query.limit,1000);return {keys:[...map.keys()].filter(k=>k.startsWith(query.prefix)).sort().map(name=>({name})),list_complete:!options.truncated};}}};
   return {env,map,calls,options,get reads(){return reads;},get password(){return password;},setMailbox(x){mailbox=x;}};
 }
 let checks=0;
@@ -59,23 +59,23 @@ await check("existing FortMail credential protected",async()=>{
 });
 await check("successful creation sealed and indexed; bounded calls with large unrelated store",async()=>{
   const f=fixture();const out=await api.walletCreate(f.env,input);assert.equal(out.verified_imap,true);assert.equal(f.calls.length,4);assert.ok(f.reads<16);assert.equal(f.map.get("imap:other@example.test"),"unrelated-preserved");
-  assert.deepEqual(JSON.parse(f.map.get("imapboxes")),["other@example.test",input.addr]);assert.equal(JSON.parse(f.map.get("create:"+input.addr)).state,"done");
+  assert.deepEqual(Array.from(await api.listImap(f.env)),["other@example.test",input.addr]);assert.equal(f.map.get("imapboxes"),JSON.stringify(["other@example.test"]));assert.equal(JSON.parse(f.map.get("create:"+input.addr)).state,"done");
   assert.ok(!JSON.stringify([...f.map.values(),out,logs]).includes(f.password));
 });
 await check("provider failure retains sealed state, no repeated create",async()=>{
-  const f=fixture({providerFailure:true});assert.equal((await api.walletCreate(f.env,input)).state,"provider_unconfirmed");assert.ok(!f.map.has("imap:"+input.addr));assert.equal((await api.walletCreate(f.env,input)).state,"reconciliation_required");assert.equal(f.calls.filter(x=>x.method==="POST").length,1);assert.ok(!JSON.stringify([...f.map.values(),logs]).includes(f.password));
+  const f=fixture({providerFailure:true});assert.equal((await api.walletCreate(f.env,input)).state,"provider_unconfirmed");assert.ok(!f.map.has("imap-created:"+input.addr));assert.equal((await api.walletCreate(f.env,input)).state,"reconciliation_required");assert.equal(f.calls.filter(x=>x.method==="POST").length,1);assert.ok(!JSON.stringify([...f.map.values(),logs]).includes(f.password));
 });
 await check("verification failure retains pending state; replay verifies without reset",async()=>{
-  const f=fixture({verifyFailure:true});assert.equal((await api.walletCreate(f.env,input)).state,"verify_failed");assert.ok(!f.map.has("imap:"+input.addr));f.options.verifyFailure=false;assert.equal((await api.walletCreate(f.env,input)).ok,true);assert.equal(f.calls.filter(x=>x.method==="POST").length,1);
+  const f=fixture({verifyFailure:true});assert.equal((await api.walletCreate(f.env,input)).state,"verify_failed");assert.ok(!f.map.has("imap-created:"+input.addr));f.options.verifyFailure=false;assert.equal((await api.walletCreate(f.env,input)).ok,true);assert.equal(f.calls.filter(x=>x.method==="POST").length,1);
 });
 await check("lost provider reply reconciles existing mailbox without repeated POST",async()=>{
   const f=fixture({lostReply:true});assert.equal((await api.walletCreate(f.env,input)).state,"provider_unconfirmed");assert.equal((await api.walletCreate(f.env,input)).ok,true);assert.equal(f.calls.filter(x=>x.method==="POST").length,1);
 });
-await check("done replay rechecks provider and IMAP; repairs missing index",async()=>{
-  const f=fixture();await api.walletCreate(f.env,input);f.map.set("imapboxes",JSON.stringify(["other@example.test"]));assert.equal((await api.walletCreate(f.env,input)).ok,true);assert.ok(JSON.parse(f.map.get("imapboxes")).includes(input.addr));assert.equal(f.calls.filter(x=>x.method==="POST").length,1);
+await check("done replay rechecks provider and IMAP; restores missing per-address record",async()=>{
+  const f=fixture();await api.walletCreate(f.env,input);f.map.delete("imap-created:"+input.addr);assert.equal((await api.walletCreate(f.env,input)).ok,true);assert.ok((await api.listImap(f.env)).includes(input.addr));assert.equal(f.calls.filter(x=>x.method==="POST").length,1);
 });
 await check("settings drift and missing provider fail closed without reset",async()=>{
-  const f=fixture({settingsDrift:true});assert.equal((await api.walletCreate(f.env,input)).state,"settings_unverified");assert.ok(!f.map.has("imap:"+input.addr));f.setMailbox(null);assert.equal((await api.walletCreate(f.env,input)).state,"reconciliation_required");assert.equal(f.calls.filter(x=>x.method==="POST").length,1);
+  const f=fixture({settingsDrift:true});assert.equal((await api.walletCreate(f.env,input)).state,"settings_unverified");assert.ok(!f.map.has("imap-created:"+input.addr));f.setMailbox(null);assert.equal((await api.walletCreate(f.env,input)).state,"reconciliation_required");assert.equal(f.calls.filter(x=>x.method==="POST").length,1);
 });
 await check("secret-free HTTP failure responses and no logs",async()=>{
   for(const opts of [{verifyThrows:true},{providerFailure:true},{brokerDenied:true}]){const f=fixture(opts);const r=await api.worker.fetch(request({authorization:"Bearer synthetic-admin"}),f.env);const body=await r.text();assert.ok(r.status>=400);if(f.password)assert.ok(!body.includes(f.password));assert.ok(!body.includes("must-not-escape"));assert.ok(!JSON.stringify([...f.map.values(),logs]).includes("must-not-escape"));}
@@ -84,5 +84,57 @@ await check("secret-free HTTP failure responses and no logs",async()=>{
 await check("concurrent initial attempts use identical strong password; no overwrite/reset",async()=>{
   const f=fixture();const a=await api.creationPassword(f.env,input.addr),b=await api.creationPassword(f.env,input.addr);assert.equal(a,b);assert.ok(a.length>=40);assert.notEqual(a,await api.creationPassword(f.env,"different@example.test"));
   const results=await Promise.all([api.walletCreate(f.env,input),api.walletCreate(f.env,input)]);assert.ok(results.some(x=>x.ok));assert.ok(!f.calls.some(x=>x.method==="PUT"||x.method==="DELETE"));assert.equal((await api.walletCreate(f.env,input)).ok,true);
+});
+await check("adversarial stale KV views preserve different-address creations and a concurrent legacy index write",async()=>{
+  // Both requests see old snapshots, including stale negatives for new keys.
+  // The backing map records writes only; it is NOT the consistency model.
+  const initial=JSON.stringify(["other@example.test"]);
+  const store=new Map([["wallet_key",btoa("w".repeat(32))],["imapboxes",initial]]);
+  const provider=new Map(),passwords=new Map(),writes=[];let stale=true,indexReads=0,release;
+  const barrier=new Promise(resolve=>{release=resolve;});
+  context.fetch=async(url,init)=>{
+    const {request}=JSON.parse(init.body),u=new URL(request.url),local=u.pathname.split("/").at(-1);
+    if(request.method==="POST"){
+      const p=JSON.parse(request.body),addr=p.local_part+"@example.test";
+      passwords.set(addr,p.password);provider.set(p.local_part,{...p,address:addr,forwardings:[]});
+      return Response.json({authorized:true,status:200,body:{}});
+    }
+    const box=u.pathname.includes("/aliases/")?null:provider.get(local);
+    return Response.json({authorized:true,status:box?200:404,body:box||{}});
+  };
+  api.setVerify(async(host,addr,pw)=>({ok:passwords.get(addr)===pw}));
+  const env={MIGADU_BROKER_URL:"https://broker.test",MIGADU_BROKER_REPO:"fixture/repo",MIGADU_BROKER_CARD:"fixture-card",TOKENS:{
+    async get(key){
+      if(stale&&key==="imapboxes"){
+        if(++indexReads===2){store.set(key,JSON.stringify(["other@example.test","legacy@example.test"]));release();}
+        await barrier;return initial;
+      }
+      if(stale&&(key.startsWith("create:")||key.startsWith("imap:")||key.startsWith("imap-created:")))return null;
+      return store.get(key)??null;
+    },
+    async list(query){assert.deepEqual(JSON.parse(JSON.stringify(query)),{prefix:"imap-created:",limit:1000});return {keys:stale?[]:[...store.keys()].filter(k=>k.startsWith(query.prefix)).map(name=>({name})),list_complete:true};},
+    async put(key,value){writes.push(key);store.set(key,value);}
+  }};
+  const result=await Promise.all([api.walletCreate(env,{addr:"one@example.test",name:"One"}),api.walletCreate(env,{addr:"two@example.test",name:"Two"})]);
+  assert.ok(result.every(r=>r.ok));assert.ok(!writes.includes("imapboxes"));
+  assert.ok(!writes.some(k=>k.startsWith("imap:")));stale=false;
+  assert.deepEqual(new Set(await api.listImap(env)),new Set(["other@example.test","legacy@example.test","one@example.test","two@example.test"]));
+  assert.ok(store.has("imap-created:one@example.test"));assert.ok(store.has("imap-created:two@example.test"));
+});
+await check("creation promotion cannot overwrite concurrent legacy credential despite stale negative reads",async()=>{
+  const f=fixture();const originalPut=f.env.TOKENS.put;
+  const lifecycle=JSON.stringify({host:"imap.migadu.com",smtp:"smtp.migadu.com",user:input.addr,sealed:"concurrent-lifecycle-value"});
+  f.env.TOKENS.put=async(key,value)=>{
+    if(key==="imap-created:"+input.addr)f.map.set("imap:"+input.addr,lifecycle);
+    await originalPut(key,value);
+  };
+  assert.equal((await api.walletCreate(f.env,input)).ok,true);
+  assert.equal(f.map.get("imap:"+input.addr),lifecycle);
+  assert.equal(await api.imapCredential(f.env,input.addr),lifecycle);
+  assert.ok(f.map.has("imap-created:"+input.addr));
+});
+await check("bounded index refuses silent truncation",async()=>{
+  const f=fixture({truncated:true});await assert.rejects(api.listImap(f.env),/bounded listing capacity/);
+  assert.equal(f.calls.length,0);
 });
 console.log(`${checks} fixture checks passed; no live provider calls.`);

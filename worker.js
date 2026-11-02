@@ -39,7 +39,18 @@ async function refreshTok(env,refreshToken){const b=new URLSearchParams({client_
 async function gapi(at,path,init){const r=await fetch("https://gmail.googleapis.com/gmail/v1"+path,{...(init||{}),headers:{authorization:"Bearer "+at,...((init&&init.headers)||{})}});if(!r.ok)throw new Error("gmail "+r.status+": "+(await r.text()).slice(0,300));return r.json();}
 async function listAccounts(env){const a=await env.TOKENS.get("accounts");return a?JSON.parse(a):[];}
 async function addAccount(env,email){const a=await listAccounts(env);if(!a.includes(email)){a.push(email);await env.TOKENS.put("accounts",JSON.stringify(a));}}
-async function listImap(env){const a=await env.TOKENS.get("imapboxes");return a?JSON.parse(a):[];}
+// Legacy lifecycle routes retain their shared array. Creation owns separate,
+// per-address keys, so a stale array/list read can never erase another entry.
+// One bounded prefix list, no per-mailbox credential reads or full-store scan.
+async function listImap(env){
+  const a=await env.TOKENS.get("imapboxes");
+  const page=await env.TOKENS.list({prefix:"imap-created:",limit:1000});
+  if(!page.list_complete)throw new Error("created mailbox index exceeds bounded listing capacity");
+  return [...new Set([...(a?JSON.parse(a):[]),...page.keys.map(k=>k.name.slice("imap-created:".length))])];
+}
+// Explicit legacy import/rotation wins. Creation never writes their key, even
+// when a stale KV read misses a concurrent lifecycle operation.
+async function imapCredential(env,addr){return await env.TOKENS.get("imap:"+addr)||await env.TOKENS.get("imap-created:"+addr);}
 // Triage scopes are derived, never hardcoded: "gmail" + one scope per IMAP domain.
 async function getScopes(env){const domains=[...new Set((await listImap(env)).map(a=>a.split("@")[1]).filter(Boolean))];return ["gmail",...domains];}
 async function imapConn(host,user,pass,timeoutMs=0){
@@ -165,7 +176,7 @@ function ownerRegex(env){
   return new RegExp(owners.map(o=>o.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")).join("|"),"i");
 }
 async function stewardBridgeOne(env,watch,dry){
-  const c=await env.TOKENS.get("imap:"+watch);if(!c)return {watch,error:"watch box not provisioned"};
+  const c=await imapCredential(env,watch);if(!c)return {watch,error:"watch box not provisioned"};
   const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);
   const items=await imapUnseen(cc.host,cc.user,pass,10);
   if(dry)return {watch,unseen:items.length,items};
@@ -405,7 +416,7 @@ async function imapVerify(host,user,pass,options={}){
 async function rotateMailbox(env,addr){
   const a=String(addr||"").trim().toLowerCase();
   if(!a||!a.includes("@"))throw new Error("need addr — a provisioned IMAP mailbox address");
-  const raw=await env.TOKENS.get("imap:"+a);
+  const raw=await imapCredential(env,a);
   if(!raw)throw new Error("unknown mailbox "+a+" — only provisioned IMAP boxes can be rotated");
   const rec=JSON.parse(raw);
   const at=a.indexOf("@");const local=a.slice(0,at),domain=a.slice(at+1);
@@ -466,9 +477,9 @@ async function walletCreate(env,input){
   // Creation is confined to domains already connected to this deployment.
   const boxes=await listImap(env);
   if(!boxes.some(a=>a.endsWith("@"+domain)))return {ok:false,addr,state:"domain_not_connected"};
-  const journalKey="create:"+addr,activeKey="imap:"+addr;
+  const journalKey="create:"+addr,activeKey="imap-created:"+addr;
   let journal=JSON.parse(await env.TOKENS.get(journalKey)||"null");
-  const active=JSON.parse(await env.TOKENS.get(activeKey)||"null");
+  const active=JSON.parse(await imapCredential(env,addr)||"null");
   // Compare plaintext only inside the Worker: concurrent seal() calls have
   // distinct IVs even though the derived creation password is identical.
   const matches=async rec=>{
@@ -507,11 +518,11 @@ async function walletCreate(env,input){
   let verified=false;
   try{verified=(await imapVerify("imap.migadu.com",addr,await unseal(env,journal.sealed),{waits:[0,1000,3000],timeoutMs:8000})).ok;}catch(e){}
   if(!verified)return await save("verify_failed");
-  const current=JSON.parse(await env.TOKENS.get(activeKey)||"null");
+  const current=JSON.parse(await imapCredential(env,addr)||"null");
   if(current&&!(await matches(current)))return {ok:false,addr,state:"already_connected"};
-  if(!current)await env.TOKENS.put(activeKey,JSON.stringify({host:"imap.migadu.com",smtp:"smtp.migadu.com",user:addr,sealed:journal.sealed}));
-  const latest=await listImap(env);
-  if(!latest.includes(addr)){latest.push(addr);await env.TOKENS.put("imapboxes",JSON.stringify(latest));}
+  // This per-address record is BOTH credential fallback and index entry.
+  // There is no shared-array read/modify/write and no write to imap:<addr>.
+  await env.TOKENS.put(activeKey,JSON.stringify({host:"imap.migadu.com",smtp:"smtp.migadu.com",user:addr,sealed:journal.sealed}));
   await save("done");
   return {ok:true,addr,state:"done",created:true,verified_imap:true};
 }
@@ -588,7 +599,7 @@ async function outboxDrain(env){
 // internal (Fort-to-Fort) send — everything outward goes through sendMail().
 async function sendNow(env,from,to,subject,text){
   if((await listAccounts(env)).includes(from))return {via:"gmail",id:await sendGmail(env,from,to,subject,text)};
-  const c=await env.TOKENS.get("imap:"+from);if(!c)throw new Error("unknown sender "+from);
+  const c=await imapCredential(env,from);if(!c)throw new Error("unknown sender "+from);
   const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);const smtpHost=cc.smtp||(cc.host||"").replace(/^imap\./,"smtp.");
   if(!smtpHost)throw new Error("no smtp host for "+from);
   await smtpSend(smtpHost,cc.user,pass,from,to,subject,text);return {via:"smtp",ok:true};
@@ -716,7 +727,7 @@ async function newsSuppress(env,email){
   return hit;
 }
 async function triageGmail(env,email){const items=await gmailRecent(env,email,20);return {source:"gmail",scanned:items.length,desk:items.filter(i=>i.verdict==="desk"),record:items.filter(i=>i.verdict==="record"),ignored:items.filter(i=>i.verdict==="ignore").length};}
-async function triageBox(env,addr){const c=JSON.parse(await env.TOKENS.get("imap:"+addr));const pass=await unseal(env,c.sealed);const {total,recent,items}=await imapHeaders(c.host,c.user,pass,10);const tagged=items.map(i=>({...i,verdict:verdict(env,i.from,i.subject,"",i.unsub)}));return {source:"imap",total,recent,scanned:items.length,desk:tagged.filter(i=>i.verdict==="desk"),record:tagged.filter(i=>i.verdict==="record"),ignored:tagged.filter(i=>i.verdict==="ignore").length};}
+async function triageBox(env,addr){const c=JSON.parse(await imapCredential(env,addr));const pass=await unseal(env,c.sealed);const {total,recent,items}=await imapHeaders(c.host,c.user,pass,10);const tagged=items.map(i=>({...i,verdict:verdict(env,i.from,i.subject,"",i.unsub)}));return {source:"imap",total,recent,scanned:items.length,desk:tagged.filter(i=>i.verdict==="desk"),record:tagged.filter(i=>i.verdict==="record"),ignored:tagged.filter(i=>i.verdict==="ignore").length};}
 async function runScope(env,scopeKey){
   let desk=[];
   if(scopeKey==="gmail"){const accts=await listAccounts(env);const res=await Promise.all(accts.map(e=>triageGmail(env,e).then(r=>({e,r})).catch(()=>null)));for(const x of res){if(x&&x.r)for(const i of x.r.desk)desk.push({box:x.e,source:"gmail",subject:i.subject,from:i.from,date:i.date});}}
@@ -752,8 +763,8 @@ async function callTool(env,name,args){
   if(name==="list_accounts")return {gmail:await listAccounts(env),imap:await listImap(env)};
   if(name==="get_desk")return await readDesk(env);
   if(name==="triage"){const sc=args.scope;if(sc==="gmail"){const out={};for(const e of await listAccounts(env))out[e]=await triageGmail(env,e).catch(x=>({error:String(x.message||x)}));return out;}const out={};for(const a of (await listImap(env)).filter(a=>a.endsWith("@"+sc)))out[a]=await triageBox(env,a).catch(x=>({error:String(x.message||x)}));return out;}
-  if(name==="read_box"){const a=args.address,n=args.count||10;if((await listAccounts(env)).includes(a))return {address:a,messages:await gmailRecent(env,a,n)};const c=await env.TOKENS.get("imap:"+a);if(!c)throw new Error("unknown mailbox "+a);const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);const {total,recent,items}=await imapHeaders(cc.host,cc.user,pass,n);return {address:a,total,recent,messages:items};}
-  if(name==="read_message"){const a=args.address,uid=String(args.uid||"");if(!uid)throw new Error("uid required");if((await listAccounts(env)).includes(a))return {address:a,...await gmailMessageBody(env,a,uid)};const c=await env.TOKENS.get("imap:"+a);if(!c)throw new Error("unknown mailbox "+a);const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);return {address:a,...await imapReadMessage(cc.host,cc.user,pass,uid)};}
+  if(name==="read_box"){const a=args.address,n=args.count||10;if((await listAccounts(env)).includes(a))return {address:a,messages:await gmailRecent(env,a,n)};const c=await imapCredential(env,a);if(!c)throw new Error("unknown mailbox "+a);const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);const {total,recent,items}=await imapHeaders(cc.host,cc.user,pass,n);return {address:a,total,recent,messages:items};}
+  if(name==="read_message"){const a=args.address,uid=String(args.uid||"");if(!uid)throw new Error("uid required");if((await listAccounts(env)).includes(a))return {address:a,...await gmailMessageBody(env,a,uid)};const c=await imapCredential(env,a);if(!c)throw new Error("unknown mailbox "+a);const cc=JSON.parse(c);const pass=await unseal(env,cc.sealed);return {address:a,...await imapReadMessage(cc.host,cc.user,pass,uid)};}
   if(name==="get_attachment"){
     const a=args.address,uid=String(args.uid||args.message||""),aid=String(args.attachmentId||"");
     if(!uid||!aid)throw new Error("uid and attachmentId required");

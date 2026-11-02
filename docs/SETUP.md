@@ -80,6 +80,27 @@ retry. `verify_failed` and `settings_unverified` preserve the sealed state and
 can be checked again with the same request. Every successful replay rechecks
 Migadu metadata and IMAP rather than trusting a cached `done` flag.
 
+Creation writes its verified sealed credential to the per-address
+`imap-created:<addr>` key. That key also supplies the new account index entry.
+It never replaces the shared legacy `imapboxes` array or writes the legacy
+`imap:<addr>` credential. Account listing unions the legacy array with one
+bounded KV prefix listing (up to 1,000 creation entries); truncation is an
+explicit error rather than an incomplete successful list. No new bindings
+or credential migration is required. Existing legacy credentials take priority
+for every read, send, triage and rotation path.
+
+KV reads and prefix listings remain eventually consistent: newly created
+accounts may appear after propagation. Success verifies the provider and IMAP
+at that moment; it does not freeze provider settings or assert global atomicity.
+Concurrent imports/rotations can still race with each other in the existing
+legacy lifecycle routes. Creation cannot erase their stored credential or a
+different account's index entry, even if it misses those writes on a stale read.
+A concurrent lifecycle change can invalidate the just-verified creation password;
+the explicit legacy credential takes precedence once its write is visible.
+Do not run credential-changing operations concurrently for the same mailbox.
+The existing shared-array race between legacy provision/import operations is
+unchanged; this route no longer participates in that read/modify/write cycle.
+
 Run `node --check worker.js`, `node test/wallet-create.mjs`, and
 `node test/gmail-attachments.mjs` before deployment. Preserve every live binding
 and secret, compare uploaded source, and read `/settings` back after deployment.
